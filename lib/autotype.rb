@@ -4,6 +4,7 @@ require_relative "autotype/version"
 require_relative "autotype/type_string"
 require_relative "autotype/profile"
 require_relative "autotype/discovery_profile"
+require_relative "autotype/anomaly_detector"
 require_relative "autotype/engine"
 
 module Autotype

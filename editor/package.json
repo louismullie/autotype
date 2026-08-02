@@ -2,7 +2,7 @@
   "name": "autotype",
   "displayName": "Autotype",
   "description": "Inline inferred Ruby method signatures powered by the autotype gem",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "publisher": "louismullie",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/louismullie/autotype" },
@@ -27,11 +27,22 @@
           "type": "string",
           "default": "tmp/autotype_cache.json",
           "description": "Workspace-relative cache file for inferred signatures"
+        },
+        "autotype.anomalies.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show type anomaly diagnostics in the Problems panel"
+        },
+        "autotype.workspaceRefresh": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also analyze the whole repo on refresh (slow). Use Autotype: Refresh Workspace command instead."
         }
       }
     },
     "commands": [
-      { "command": "autotype.refresh", "title": "Autotype: Refresh" },
+      { "command": "autotype.refresh", "title": "Autotype: Refresh Current File" },
+      { "command": "autotype.refreshWorkspace", "title": "Autotype: Refresh Workspace" },
       { "command": "autotype.toggle", "title": "Autotype: Toggle Inline Signatures" }
     ]
   }

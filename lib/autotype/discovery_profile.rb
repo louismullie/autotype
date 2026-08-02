@@ -368,7 +368,11 @@ module Autotype
       pipeline_owners = ports.keys.to_set | @port_dsl_owners
       methods.filter_map do |method|
         next unless pipeline_owners.include?(method.owner)
-        next unless method.method_name.to_s.match?(/\Aon_[a-z_]+\z/)
+
+        name = method.method_name.to_s
+        next unless name.match?(/\Aon_[a-z_]+\z/) ||
+          name == "process" ||
+          name.match?(/\Aprocess_[a-z_]+\z/)
 
         method.method_name
       end.to_set

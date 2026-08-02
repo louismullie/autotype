@@ -130,6 +130,13 @@ module Autotype
       @structured_type_prefixes.any? { |prefix| name.start_with?(prefix) }
     end
 
+    def merge_bootstrap_member_types!
+      Autotype.bootstrap_member_types.each do |owner, fields|
+        @member_types[owner] ||= {}
+        fields.each { |member, type| @member_types[owner][member] = type }
+      end
+    end
+
     def locate_type_file(type_name)
       @type_locators.lazy.filter_map { |locator| locator.call(type_name) }.first
     end
@@ -176,8 +183,104 @@ module Autotype
     core_phrase: "String",
     hashed_id: "String",
     collection: "String",
-    distance: "Float"
+    distance: "Float",
+    line: "Integer",
+    end_line: "Integer",
+    argument_index: "Integer",
+    handler_method: "Symbol",
+    dispatch_param: "Symbol",
+    dispatch_param_type: "String",
+    entity_param: "Symbol",
+    port_keyword: "Symbol",
+    init_param: "Symbol",
+    reader_method: "Symbol",
+    ivar: "Symbol",
+    method_name: "Symbol",
+    owner: "String",
+    template: "String"
   }.freeze
+
+  TYPE_NODE = "Function | Generic | Named | TypeVariable | Union"
+  NULLABLE_TYPE_NODE = "Nullable[#{TYPE_NODE}]"
+
+  # Ground types for Data.define classes declared in this file. Without these,
+  # accessor synthesis leaves member readers as Object and poisons inference.
+  BOOTSTRAP_MEMBER_TYPE_STRINGS = {
+    "Autotype::Named" => { name: "String" },
+    "Autotype::Generic" => { name: "String", arguments: "Array[#{TYPE_NODE}]" },
+    "Autotype::Union" => { members: "Array[#{TYPE_NODE}]" },
+    "Autotype::Function" => { parameters: "Array[Autotype::Parameter]", result: TYPE_NODE },
+    "Autotype::Capability" => {
+      receiver: NULLABLE_TYPE_NODE,
+      message: "Symbol",
+      arguments: "Array[#{TYPE_NODE}]",
+      keywords: "Hash[Symbol, Object]",
+      result: NULLABLE_TYPE_NODE,
+      line: "Integer"
+    },
+    "Autotype::Parameter" => { name: "Symbol", type: TYPE_NODE, kind: "Symbol" },
+    "Autotype::TemplateArgument" => { template: "String", arguments: "Array[#{TYPE_NODE}]" },
+    "Autotype::MethodResult" => {
+      name: "String",
+      owner: "String",
+      kind: "Symbol",
+      method_name: "Symbol",
+      superclass: "Nullable[String]",
+      line: "Integer",
+      end_line: "Integer",
+      parameters: "Array[Autotype::Parameter]",
+      result: TYPE_NODE,
+      capabilities: "Array[Autotype::Capability]",
+      self_type: TYPE_NODE,
+      ivars: "Hash[Symbol, #{TYPE_NODE}]",
+      locals: "Hash[Symbol, #{TYPE_NODE}]",
+      port_assignments: "Array[Object]",
+      case_narrowings: "Hash[Symbol, Array[#{TYPE_NODE}]]"
+    },
+    "Autotype::InferenceMetadata::PortWiring" => {
+      handler_method: "Symbol",
+      dispatch_param: "Symbol",
+      dispatch_param_type: "String",
+      entity_param: "Symbol"
+    },
+    "Autotype::InferenceMetadata::OutputEmitWiring" => {
+      message: "Symbol",
+      port_keyword: "Symbol",
+      argument_index: "Integer"
+    },
+    "Autotype::InferenceMetadata::ConfigHashWiring" => {
+      init_param: "Symbol",
+      reader_method: "Symbol",
+      ivar: "Symbol"
+    },
+    "Autotype::TypeVariable" => { id: "Integer", hint: "Nullable[Symbol]" },
+    "Autotype::InferenceMetadata" => {
+      member_types: "Hash[String, Hash[Symbol, Object]]",
+      ports: "Hash[String, Hash[Symbol, Hash[Symbol, Object]]]",
+      config_options: "Hash[String, Hash[Symbol, Object]]",
+      structured_owners: "Set",
+      referenced_types: "Set",
+      member_type_hints: "Hash[Symbol, String]",
+      option_type_hints: "Hash[Symbol, String]",
+      side_effect_methods: "Set",
+      structured_type_prefixes: "Array[String]",
+      port_wiring: "Nullable[Autotype::InferenceMetadata::PortWiring]",
+      output_emit: "Nullable[Autotype::InferenceMetadata::OutputEmitWiring]",
+      config_hash: "Nullable[Autotype::InferenceMetadata::ConfigHashWiring]",
+      framework_self_fallbacks: "Hash[Symbol, Object]",
+      type_locators: "Array[Object]"
+    }
+  }.freeze
+
+  def self.bootstrap_member_types
+    @bootstrap_member_types ||= BOOTSTRAP_MEMBER_TYPE_STRINGS.transform_values do |fields|
+      fields.transform_values { |type_string| TypeString.parse(type_string) }
+    end
+  end
+
+  def self.bootstrap_member_type(owner, member)
+    bootstrap_member_types.dig(owner, member)
+  end
 
   # Kernel module functions invoked without an explicit receiver (`Array(x)`).
   KERNEL_CLASS_CALLS = %i[Array Integer Float String Symbol Hash].freeze
@@ -874,6 +977,12 @@ module Autotype
       nil
     end
 
+    def member_type_hint(owner, member)
+      Autotype.bootstrap_member_type(owner, member) ||
+        @profile&.member_type_hints&.fetch(member, nil) ||
+        core_member_type_hint(member)
+    end
+
     def core_member_type_hint(member)
       type_name = CORE_MEMBER_NAME_TYPES[member]
       Named.new(type_name) if type_name
@@ -915,7 +1024,7 @@ module Autotype
         members.each { |member| methods << synthesized_accessor(member, value, writer: false) }
         methods << synthesized_member_initializer(members, value)
         members.each do |member|
-          hint = @profile&.member_type_hints&.fetch(member, nil) || core_member_type_hint(member)
+          hint = member_type_hint(current_owner, member)
           declared_member_types[current_owner][member] = hint if hint
         end
       ensure
@@ -1026,6 +1135,8 @@ module Autotype
       names.each do |name|
         methods << synthesized_accessor(name, node, writer: false) unless node.name == :attr_writer
         methods << synthesized_accessor(name, node, writer: true) unless node.name == :attr_reader
+        hint = member_type_hint(current_owner, name)
+        declared_member_types[current_owner][name] = hint if hint
       end
     end
 
@@ -1088,7 +1199,7 @@ module Autotype
       == != < <= > >= all? any? blank? connected? empty? eql? include?
       is_a? key? member? nil? present? respond_to? start_with? end_with? zero?
     ].to_set.freeze
-    INTEGER_RESULTS = %i[count length size bytesize].to_set.freeze
+    INTEGER_RESULTS = %i[count length size bytesize hash object_id].to_set.freeze
     STRING_RESULTS = %i[
       strip lstrip rstrip chomp chop squeeze tr downcase upcase capitalize
       swapcase gsub sub join to_json encode truncate squish
@@ -1178,6 +1289,8 @@ module Autotype
       CORE_MEMBER_NAME_TYPES.each do |member, type_name|
         type = Named.new(type_name)
         @duck_index[member].each do |accessor|
+          next if @metadata.member_types.dig(accessor.owner, member)
+
           unify(accessor.result, type)
           accessor.ivars.each_value { |ivar| unify(ivar, type) }
         end
@@ -1188,9 +1301,16 @@ module Autotype
       @methods.each do |method|
         next unless method.kind == :instance && method.method_name == :initialize
 
+        send_results = method.capabilities.map(&:result)
         method.parameters.each do |parameter|
           ivar = method.ivars[:"@#{parameter.name}"]
-          unify(parameter.type, ivar) if ivar
+          next unless ivar
+          # `@x = transform(x)` stores a derived value, not the parameter.
+          # Unifying the parameter with a send result creates a cycle that
+          # collapses both to Object (e.g. `@collections = Array(collections)`).
+          next if send_results.any? { |result| result.equal?(ivar) }
+
+          unify(parameter.type, ivar)
         end
       end
     end
@@ -1199,10 +1319,16 @@ module Autotype
       @metadata.member_types.each do |owner, fields|
         fields.each do |member, type|
           accessor = @index[[owner, :instance, member]]
-          next unless accessor
+          if accessor
+            unify(accessor.result, type)
+            accessor.ivars.each_value { |ivar| unify(ivar, type) }
+          end
 
-          unify(accessor.result, type)
-          accessor.ivars.each_value { |ivar| unify(ivar, type) }
+          initializer = @index[[owner, :instance, :initialize]]
+          next unless initializer
+
+          parameter = initializer.parameters.find { |candidate| candidate.name == member }
+          unify(parameter.type, type) if parameter
         end
       end
     end
@@ -1638,6 +1764,10 @@ module Autotype
         unify(result, Named.new("nil")) if receiver == Named.new("Logger")
       when :logger
         unify(result, Named.new("Logger"))
+      when :fetch_chat
+        unify(result, Named.new("Dox::AI::Provider::Response"))
+      when :content
+        unify(result, Named.new("String")) if llm_response_type?(receiver)
       when :tap, :itself, :dup, :clone, :freeze, :deep_dup, :with
         unify(result, receiver)
       when :synchronize
@@ -2671,12 +2801,37 @@ module Autotype
     # bool, `to_*`/`*_hash` converters return their conventional type.
     def apply_definition_conventions!
       @methods.each do |method|
+        if array_normalizer_return?(method.method_name)
+          anchor_array_normalizer_return!(method)
+          next
+        end
+
         default = convention_default(method.method_name.to_s)
         next unless default
 
         parameter_terminals = method.parameters.map { |parameter| dereference(parameter.type) }
         residual = residual_return_variables(method) - parameter_terminals
         residual.each { |variable| unify(variable, default) }
+      end
+    end
+
+    ARRAY_NORMALIZER_METHODS = %w[
+      normalize_array normalize_json_array normalize_locations normalize_phases phase_keys
+    ].freeze
+
+    def array_normalizer_return?(name)
+      ARRAY_NORMALIZER_METHODS.include?(name.to_s)
+    end
+
+    def anchor_array_normalizer_return!(method)
+      array_type = Generic.new("Array", [Named.new("Object")])
+      force_return!(method, array_type)
+
+      parameter_terminals = method.parameters.map { |parameter| dereference(parameter.type) }
+      residual_return_variables(method).each do |variable|
+        next if parameter_terminals.include?(variable)
+
+        unify(variable, array_type)
       end
     end
 
@@ -2740,14 +2895,18 @@ module Autotype
       end
     end
 
-    def resolve_chained_source_type(method, capability)
+    def resolve_chained_source_type(method, capability, visited = nil)
+      visited ||= Set.new.compare_by_identity
+      return nil if visited.include?(capability.object_id)
+
+      visited.add(capability.object_id)
       receiver = resolve(capability.receiver)
       return receiver unless receiver.is_a?(TypeVariable)
 
       source = method.capabilities.find { |other| other.result.equal?(receiver) }
       return nil unless source
 
-      parent_type = resolve_chained_source_type(method, source)
+      parent_type = resolve_chained_source_type(method, source, visited)
       return nil unless parent_type
 
       case source.message
@@ -2874,6 +3033,10 @@ module Autotype
       end
     end
 
+    def skip_residual_narrowing?(method)
+      array_normalizer_return?(method.method_name)
+    end
+
     # One narrowing round; returns true when new evidence was attached so a
     # follow-up round can propagate it through forwarding methods.
     def narrowing_round
@@ -2887,6 +3050,8 @@ module Autotype
 
       changed = false
       observations.each do |callee, calls|
+        next if skip_residual_narrowing?(callee)
+
         parameter_variables = callee.parameters.map { |parameter| dereference(parameter.type) }
         residual = residual_return_variables(callee) - parameter_variables
         next if residual.empty?
@@ -2953,6 +3118,18 @@ module Autotype
       groups.values.sort_by { |send| send.fetch(:message).to_s }
     end
 
+    def side_effect_return_type(method)
+      return Named.new("nil") if @metadata.side_effect_methods.include?(method.method_name)
+
+      resolve(method.result)
+    end
+
+    def llm_response_type?(receiver)
+      return false unless receiver.is_a?(Named)
+
+      receiver.name == "Dox::AI::Provider::Response" || receiver.name.end_with?("::Provider::Response")
+    end
+
     def merge_union(left, right)
       return left if left == right
 
@@ -2973,7 +3150,7 @@ module Autotype
         parameters: method.parameters.map do |parameter|
           Parameter.new(name: parameter.name, type: resolve(parameter.type), kind: parameter.kind)
         end,
-        result: resolve(method.result),
+        result: side_effect_return_type(method),
         capabilities: method.capabilities.map do |capability|
           Capability.new(
             receiver: resolve(capability.receiver),
@@ -3277,7 +3454,7 @@ module Autotype
 
     def text
       params = @method.parameters.map { |parameter| render_parameter(parameter) }.join(", ")
-      signature = "#{@method.name} : (#{params}) -> #{render(@method.result, grounded_only: true)}"
+      signature = "#{@method.name} : (#{params}) -> #{render_return_type(@method.result)}"
       helpers = helper_definitions.map do |helper|
         parameters = helper.fetch(:parameters)
         generic = parameters.empty? ? "" : "<#{parameters.join(", ")}>"
@@ -3294,7 +3471,7 @@ module Autotype
     end
 
     def as_json
-      {
+      payload = {
         name: @method.name,
         line: @method.line,
         end_line: @method.end_line,
@@ -3304,6 +3481,8 @@ module Autotype
         send_constraint_count: @method.capabilities.length,
         locals: rendered_bindings
       }
+      payload[:anomalies] = AnomalyDetector.detect(payload)
+      payload
     end
 
     private
@@ -3423,6 +3602,17 @@ module Autotype
       return false unless receiver.is_a?(TypeVariable) && record_parameter?(receiver)
 
       field_name_from_index_key(capability.arguments.first)
+    end
+
+    def render_return_type(type)
+      rendered = render(type, grounded_only: true)
+      return rendered unless toxic_display_type?(rendered)
+
+      render(type, grounded_only: true, skip_helpers: true)
+    end
+
+    def toxic_display_type?(text)
+      text.length > 96 || text.match?(/(?:OrArrayOf|ArrayOfArrayOf|OrAndSymbol){2,}/i)
     end
 
     def render(type, structural: false, grounded_only: false, skip_helpers: false, depth: 0)
@@ -3989,6 +4179,8 @@ module Autotype
   # then argument types, then a full injective mangle of the definition).
   class HeuristicCapabilityNamer
     MAX_LEVEL = 5
+    MAX_NAME_LENGTH = 56
+    MAX_TYPE_WORD_LENGTH = 24
     GREEK_WORDS = /(?:Alpha|Beta|Gamma|Delta|Epsilon|Zeta|Eta|Theta|Iota|Kappa|Lambda|Mu|Nu|Xi|Omicron|Pi|Rho|Sigma|Tau|Upsilon|Phi|Chi|Psi|Omega)(?=[A-Z]|$)/
     KNOWN = {
       "to_s" => "Stringifiable", "to_str" => "Stringifiable", "inspect" => "Inspectable",
@@ -4109,7 +4301,16 @@ module Autotype
       final = single_name(sends.last)
       stems = sends[0...-1].map { |send| stem(send.fetch(:message)) }.uniq
       stems.reject! { |candidate| final.start_with?(candidate) }
-      "#{stems.join}#{final}"
+      truncate_name("#{stems.join}#{final}")
+    end
+
+    def truncate_name(name)
+      return name if name.length <= MAX_NAME_LENGTH
+
+      suffix = name[/(?:able|ible|ifiable|izable|able)\z/i] || "Able"
+      stem = name.sub(/(?:able|ible|ifiable|izable|able)\z/i, "")
+      max_stem = [MAX_NAME_LENGTH - suffix.length, 1].max
+      "#{stem[0, max_stem]}#{suffix}"
     end
 
     def single_name(send)
@@ -4149,7 +4350,8 @@ module Autotype
     end
 
     def type_words(types, slots: [])
-      dedupe_adjacent(type_tokens(types.join(", "), slots: slots)).join
+      words = dedupe_adjacent(type_tokens(types.join(", "), slots: slots)).join
+      words.length > MAX_TYPE_WORD_LENGTH ? "Mixed" : words
     end
 
     def dedupe_adjacent(words)
@@ -4157,8 +4359,9 @@ module Autotype
     end
 
     def type_tokens(type, slots: [], depth: 0, resolving: nil)
-      return [] if depth > 12
+      return [] if depth > 6
 
+      resolving ||= Set.new
       type.scan(/[A-Za-z0-9_]+|::|->|[|\[\],()]/).flat_map do |token|
         case token
         when "|" then ["Or"]
@@ -4172,24 +4375,25 @@ module Autotype
         when "bool" then ["Bool"]
         when /\AT(\d+)\z/
           index = Regexp.last_match(1).to_i
-          next [] if resolving == index
+          next [] if resolving.include?(index)
 
-          slot_type_words(index, slots: slots, depth: depth + 1)
+          slot_type_words(index, slots: slots, depth: depth + 1, resolving: resolving)
         else
           [token.split("_").map(&:capitalize).join]
         end
       end
     end
 
-    def slot_type_words(index, slots: [], depth: 0)
-      return [] if depth > 12
+    def slot_type_words(index, slots: [], depth: 0, resolving: nil)
+      resolving ||= Set.new
+      return [] if depth > 6
+      return [] if resolving.include?(index)
 
       slot = slots[index - 1]
       return [] if slot.nil? || slot.empty?
       return [] if slot.match?(/\AT\d+\z/)
-      return [] if slot.match?(/\bT\d+\b/) && !slot.match?(/[A-Za-z_]|::|\[/)
 
-      type_tokens(slot, slots: slots, depth: depth + 1, resolving: index)
+      type_tokens(slot, slots: slots, depth: depth + 1, resolving: resolving.dup.add(index))
     end
 
     def mangle(definition, slots: [])
@@ -4447,10 +4651,20 @@ module Autotype
         result.value.accept(collector)
         collector.referenced_types.each do |type_name|
           type_path = profile.locate_type_file(type_name)
-          referenced << type_path if type_path
+          referenced << normalize_scan_path(type_path) if type_path
         end
       end
-      (expanded + referenced.to_a).uniq
+      (expanded.map { |path| normalize_scan_path(path) } + referenced.to_a).uniq
+    end
+
+    # Referenced entity files resolve to absolute paths; the input list is
+    # usually relative. Normalize to cwd-relative so the same file never
+    # appears under two keys in the JSON output (which duplicates editor
+    # diagnostics).
+    def self.normalize_scan_path(path)
+      cwd = "#{Dir.pwd}/"
+      expanded = File.expand_path(path)
+      expanded.start_with?(cwd) ? expanded.delete_prefix(cwd) : path
     end
 
     def self.build_metadata(collectors, profile: default_profile)
@@ -4473,6 +4687,7 @@ module Autotype
         collector.structured_owners.each { |owner| metadata.structured_owners << owner }
         collector.referenced_types.each { |type| metadata.referenced_types << type }
       end
+      metadata.merge_bootstrap_member_types!
       metadata
     end
 

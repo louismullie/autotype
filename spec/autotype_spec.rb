@@ -449,7 +449,7 @@ RSpec.describe Autotype do
     inits = methods.values.select { |renderer| renderer.as_json.fetch(:name).end_with?("#initialize") }
     expect(inits.length).to eq(1)
     signature = inits.first.text.lines.first
-    expect(signature).to include("id: Object")
+    expect(signature).to include("id: String")
     expect(signature).not_to include("id:?")
     expect(signature).to include("score:? Nullable[Object]")
   end
@@ -534,9 +534,11 @@ RSpec.describe Autotype do
     profile.prepare_search!([actor_path])
     paths = described_class::CLI.expand_referenced_type_files([actor_path], profile: profile)
 
+    # Paths under the working directory are normalized to relative form so the
+    # JSON output never lists the same file under two keys.
     expect(paths).to include(
-      File.expand_path("fixtures/entities/tool_call.rb", __dir__),
-      File.expand_path("fixtures/entities/tool_result.rb", __dir__)
+      "spec/fixtures/entities/tool_call.rb",
+      "spec/fixtures/entities/tool_result.rb"
     )
   end
 
@@ -596,6 +598,39 @@ RSpec.describe Autotype do
     RUBY
 
     expect(methods.fetch("Actors::DemoActor#process").text.lines.first).to include("-> Integer")
+  end
+
+  it "types normalize_array as Array without runaway helper names" do
+    methods = solve(<<~RUBY)
+      module Normalization
+        module_function
+
+        def parse_json(value)
+          nil
+        end
+
+        def normalize_array(value)
+          parsed = parse_json(value)
+          value = parsed if parsed
+
+          case value
+          when nil
+            []
+          when Array
+            value
+          when String
+            value.split(/[;,]/).map(&:strip)
+          else
+            [value]
+          end.reject { |item| item.to_s.blank? }
+        end
+      end
+    RUBY
+
+    signature = methods.fetch("Normalization#normalize_array").text.lines.first
+    expect(signature).to include("Array[")
+    expect(signature).not_to match(/OrArrayOf/i)
+    expect(signature.length).to be < 200
   end
 
   it "types entity to_h as a string-keyed hash" do
