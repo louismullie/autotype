@@ -1,0 +1,9 @@
+.DS_Store
+*.o
+*.bundle
+*.so
+*.dylib
+/ext/autotype/Makefile
+/ext/autotype/autotype.bundle.dSYM/
+/native/autotype/stc_solve
+/spec/examples.txt
