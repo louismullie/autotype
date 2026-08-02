@@ -1,6 +1,6 @@
 # Autotype editor extension
 
-Inline inferred Ruby method signatures powered by the [autotype](https://github.com/doximity/autotype) gem.
+Inline inferred Ruby method signatures powered by the [autotype](https://github.com/louismullie/autotype) gem.
 
 ## Install
 

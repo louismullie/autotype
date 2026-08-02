@@ -5,12 +5,12 @@ require_relative "lib/autotype/version"
 Gem::Specification.new do |spec|
   spec.name = "autotype"
   spec.version = Autotype::VERSION
-  spec.authors = ["Doximity"]
-  spec.email = ["engineering@doximity.com"]
+  spec.authors = ["Louis Mullie"]
+  spec.email = ["louis.mullie@gmail.com"]
 
   spec.summary = "Syntax-less Ruby type inference from method usage"
   spec.description = "Infers Ruby method signatures from Prism AST analysis and fixed-point constraint solving."
-  spec.homepage = "https://github.com/doximity/autotype"
+  spec.homepage = "https://github.com/louismullie/autotype"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.2.0"
 
@@ -22,7 +22,7 @@ Gem::Specification.new do |spec|
       File.file?(path) &&
         !path.end_with?(".o", ".bundle", ".so", ".dylib", "stc_solve", "/.DS_Store") &&
         !path.include?("/.git/")
-    end + %w[README.md LICENSE autotype.gemspec Gemfile Rakefile autotype.example.yml .rspec]
+    end + %w[README.md LICENSE autotype.gemspec Gemfile Rakefile autotype.example.yml]
   end
   spec.bindir = "exe"
   spec.executables = ["autotype"]
