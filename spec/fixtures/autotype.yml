@@ -1,0 +1,9 @@
+# Optional overrides — Autotype discovers wiring and entity paths automatically.
+# Only add entries here when heuristics get something wrong.
+
+skip:
+  - vendor/**
+
+# types:
+#   members:
+#     query: MyApp::Entities::Query
