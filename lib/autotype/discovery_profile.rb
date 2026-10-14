@@ -172,9 +172,26 @@ module Autotype
 
     private
 
-    # Walked once per root: a glob per type name rewalks the whole tree (vendor/ included) on every lookup.
+    # Indexed once per root. Inside a git work tree only files git doesn't
+    # ignore are listed: a full walk drags in vendor/bundle, storage/ and the
+    # like, which costs seconds and holds no project types.
     def ruby_files_under(search_root)
-      @ruby_files_by_root[search_root] ||= Dir.glob(File.join(search_root, "**", "*.rb")).group_by { File.basename(_1) }
+      @ruby_files_by_root[search_root] ||=
+        (git_ruby_files(search_root) || Dir.glob(File.join(search_root, "**", "*.rb"))).group_by { File.basename(_1) }
+    end
+
+    # Sorted per path segment, the order Dir.glob walks in, since the first
+    # candidate defining a type wins.
+    def git_ruby_files(search_root)
+      listing = IO.popen(
+        ["git", "-C", search_root, "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.rb"],
+        err: File::NULL, &:read
+      )
+      return nil unless Process.last_status.success?
+
+      listing.split("\0").map { File.join(search_root, _1) }.select { File.file?(_1) }.sort_by { _1.split("/") }
+    rescue SystemCallError
+      nil
     end
 
     def reset_inference!
@@ -269,8 +286,9 @@ module Autotype
 
     def infer_port_wiring(methods, ports)
       owners = ports.select { |_owner, declared| declared[:inputs].any? }.keys
+      methods_by_owner = methods.group_by(&:owner)
       observations = owners.filter_map do |owner|
-        observe_port_handler(methods, owner)
+        observe_port_handler(methods_by_owner.fetch(owner, []), owner)
       end
       return observations.first if observations.length == 1
 
@@ -339,30 +357,16 @@ module Autotype
       option_owners = collectors.flat_map { |collector| collector.declared_config_options.keys }.to_set
       return if option_owners.empty?
 
-      observations = option_owners.filter_map do |owner|
-        reader = methods.find do |method|
-          method.owner == owner &&
-            method.kind == :instance &&
-            method.method_name == :options &&
-            method.parameters.empty?
-        end
-        next unless reader
-
-        {
-          init_param: :options,
-          reader_method: :options,
-          ivar: "@options"
-        }
+      # Every owner with an options reader observes the same wiring.
+      observed = methods.any? do |method|
+        method.method_name == :options &&
+          method.kind == :instance &&
+          method.parameters.empty? &&
+          option_owners.include?(method.owner)
       end
-      return if observations.empty?
+      return unless observed
 
-      grouped = observations.group_by(&:itself)
-      winner = grouped.max_by { |_key, group| group.length }&.first
-      InferenceMetadata::ConfigHashWiring.new(
-        init_param: winner.fetch(:init_param),
-        reader_method: winner.fetch(:reader_method),
-        ivar: winner.fetch(:ivar)
-      )
+      InferenceMetadata::ConfigHashWiring.new(init_param: :options, reader_method: :options, ivar: "@options")
     end
 
     def infer_side_effect_methods(methods, ports)
@@ -413,9 +417,15 @@ module Autotype
           pipeline_owners.include?(method.owner) &&
             method.capabilities.any? { |capability| capability.message == message && capability.receiver == method.self_type }
         end
-        fallbacks[message] = ->(_method, _capability) { hash_type } if used
+        fallbacks[message] = constant_fallback(hash_type) if used
       end
       fallbacks
+    end
+
+    # Built outside infer_self_fallbacks so the lambda does not capture its
+    # locals, which would keep every collected method alive for the run.
+    def constant_fallback(type)
+      ->(_method, _capability) { type }
     end
 
     def collect_referenced_constants(collector)

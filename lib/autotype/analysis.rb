@@ -93,15 +93,19 @@ module Autotype
 
         collector = Collector.new(path, profile: profile)
         result.value.accept(collector)
-        collector.referenced_types.each do |type_name|
-          type_path = profile.locate_type_file(type_name)
-          referenced << type_path if type_path
-        end
+        locate_referenced_type_files(collector, profile, referenced)
       rescue StandardError
         # The main pass records this file's diagnostic.
         next
       end
       (files + referenced.to_a).uniq
+    end
+
+    def self.locate_referenced_type_files(collector, profile, referenced)
+      collector.referenced_types.each do |type_name|
+        type_path = profile.locate_type_file(type_name)
+        referenced << type_path if type_path
+      end
     end
 
     def self.build_metadata(collectors, profile:)
@@ -139,29 +143,8 @@ module Autotype
     # Everything up to rendering, so callers can rename helpers first.
     def solve
       @profile.prepare_search!(@files) if @profile.respond_to?(:prepare_search!)
-      @files = self.class.expand_referenced_type_files(@files, profile: @profile, sources: @sources)
-      collected = @files.filter_map { |path| collect(path) }
-      collectors = collected.map(&:last)
-
-      includes = Hash.new { |hash, key| hash[key] = [] }
-      collectors.each { |collector| collector.includes.each { |owner, mods| includes[owner].concat(mods) } }
-      includes.transform_values!(&:uniq)
-      resolver = ConstantResolver.new(
-        collectors.map(&:constants).reduce({}, :merge),
-        collectors.map(&:defined_namespaces).reduce(Set.new, :|)
-      )
-      located = collected.flat_map do |path, collector|
-        collector.methods.map { |method| [path, resolver.resolve(method)] }
-      end
+      located, solved_methods = infer
       analyzed_methods = located.map(&:last)
-
-      metadata = self.class.build_metadata(collectors, profile: @profile)
-      inferencer = FixedPointInferencer.new(
-        analyzed_methods, constants: resolver.constants, includes: includes, metadata: metadata
-      )
-      solved_methods = inferencer.run
-      @iterations = inferencer.iterations
-      @converged = inferencer.converged?
       @method_reports = located.map(&:first).zip(solved_methods, analyzed_methods)
       @helper_registry = UniversalHelperRegistry.new(analyzed_methods)
       # Deterministic LLM-free names first; callers may override them.
@@ -172,8 +155,9 @@ module Autotype
     def renderers(capability_names: nil)
       @renderers ||= begin
         @helper_registry.apply_names!(capability_names) if capability_names
+        memo = Renderer.memo
         @method_reports.map do |path, method, analyzed_method|
-          [path, Renderer.new(method, analyzed_method: analyzed_method, helper_registry: @helper_registry)]
+          [path, Renderer.new(method, analyzed_method: analyzed_method, helper_registry: @helper_registry, memo: memo)]
         end
       end
     end
@@ -192,6 +176,70 @@ module Autotype
 
     private
 
+    # [[path, constant-resolved method]..., solved methods]. The solver's
+    # tables outweigh everything built after them, so the solver goes out
+    # of reach with this frame instead of being marked by every collection
+    # until rendering ends.
+    def infer
+      located, inferencer = prepare_inference
+      solved_methods = inferencer.run
+      @iterations = inferencer.iterations
+      @converged = inferencer.converged?
+      [located, solved_methods]
+    end
+
+    # [[path, constant-resolved method]..., inferencer]. The collectors and
+    # their unresolved methods stay here: kept alive through solving, they
+    # would be marked by every garbage collection.
+    def prepare_inference
+      collected = collect_with_referenced_type_files
+      collectors = collected.map { |_path, collector| collector }
+
+      includes = Hash.new { |hash, key| hash[key] = [] }
+      collectors.each { |collector| collector.includes.each { |owner, mods| includes[owner].concat(mods) } }
+      includes.transform_values!(&:uniq)
+      resolver = ConstantResolver.new(
+        collectors.map(&:constants).reduce({}, :merge),
+        collectors.map(&:defined_namespaces).reduce(Set.new, :|)
+      )
+      located = collected.flat_map do |path, collector|
+        collector.methods.map { |method| [path, resolver.resolve(method)] }
+      end
+
+      metadata = self.class.build_metadata(collectors, profile: @profile)
+      # A stale stack slot can still reach a collector's method list, so it
+      # is emptied rather than merely dropped.
+      collectors.each { |collector| collector.methods.clear }
+      inferencer = FixedPointInferencer.new(
+        located.map(&:last), constants: resolver.constants, includes: includes, metadata: metadata
+      )
+      [located, inferencer]
+    end
+
+    # What expand_referenced_type_files then a collect of every file would
+    # produce, parsing and collecting each file once: a collector's output
+    # depends only on its file, so the given files' collectors also supply
+    # the referenced types. Referenced files are collected but not expanded.
+    def collect_with_referenced_type_files
+      collected = {}
+      referenced = Set.new
+      @files.each do |path|
+        next if collected.key?(path)
+
+        entry = collected[path] = collect(path)
+        next unless entry && entry[2]
+
+        begin
+          self.class.locate_referenced_type_files(entry[1], @profile, referenced)
+        rescue StandardError
+          next
+        end
+      end
+      @files = (@files + referenced.to_a).uniq
+      @files.filter_map { |path| collected.fetch(path) { collect(path) } }
+    end
+
+    # [path, collector, whether the whole file was visited]
     def collect(path)
       result = self.class.parse(path, @sources)
       unless result.success?
@@ -204,16 +252,18 @@ module Autotype
       end
 
       collector = Collector.new(path, profile: @profile)
-      begin
+      visited = begin
         result.value.accept(collector)
+        true
       rescue StandardError => error
         # Methods collected before the failure are still sound.
         @diagnostics << Diagnostic.new(
           kind: :analysis, path: path, line: nil, name: nil, message: "#{error.class}: #{error.message}"
         )
+        false
       end
       @diagnostics.concat(collector.diagnostics)
-      [path, collector]
+      [path, collector, visited]
     rescue SystemCallError => error
       @diagnostics << Diagnostic.new(kind: :parse, path: path, line: nil, name: nil, message: error.message)
       nil

@@ -21,11 +21,106 @@ require "async"
 require "async/semaphore"
 
 module Autotype
-  Named = Data.define(:name)
-  Generic = Data.define(:name, :arguments)
-  Union = Data.define(:members)
-  Function = Data.define(:parameters, :result)
+  # Type terms are built by the million while solving, and a Data instance
+  # costs twice the allocations of a plain frozen object. These keep Data's
+  # equality and inspect output; composite hashes are computed once, since
+  # unions are deduplicated constantly.
+  class Named
+    attr_reader :name, :hash
+
+    def initialize(name)
+      @name = name
+      @hash = name.hash
+      freeze
+    end
+
+    def ==(other) = equal?(other) || (other.instance_of?(Named) && name == other.name)
+    def eql?(other) = equal?(other) || (other.instance_of?(Named) && name.eql?(other.name))
+    def inspect = "#<data #{self.class.name} name=#{name.inspect}>"
+    alias to_s inspect
+  end
+
+  class Generic
+    attr_reader :name, :arguments, :hash
+
+    def initialize(name, arguments)
+      @name = name
+      @arguments = arguments.freeze
+      @hash = name.hash ^ arguments.hash
+      freeze
+    end
+
+    # Equal terms have equal hashes, so comparing those first rejects most
+    # unequal pairs without walking them.
+    def ==(other)
+      equal?(other) ||
+        (other.instance_of?(Generic) && hash == other.hash && name == other.name && arguments == other.arguments)
+    end
+
+    def eql?(other)
+      equal?(other) ||
+        (other.instance_of?(Generic) && hash == other.hash && name.eql?(other.name) && arguments.eql?(other.arguments))
+    end
+
+    def inspect = "#<data #{self.class.name} name=#{name.inspect}, arguments=#{arguments.inspect}>"
+    alias to_s inspect
+  end
+
+  class Union
+    attr_reader :members, :hash
+
+    # Hashing every member of a union tens of thousands wide costs more than
+    # building it, and most such unions are never hashed at all. Any function
+    # of the members agrees with eql?, so wide ones hash a spread of them.
+    SAMPLED_HASH_MIN = 64
+    HASH_SAMPLES = 16
+
+    def initialize(members)
+      @members = members.freeze
+      @hash = members.length < SAMPLED_HASH_MIN ? ~members.hash : Union.sampled_hash(members)
+      freeze
+    end
+
+    def self.sampled_hash(members)
+      last = members.length - 1
+      sample = Array.new(HASH_SAMPLES) { |index| members[index * last / (HASH_SAMPLES - 1)] }
+      ~(sample << members.length).hash
+    end
+
+    def ==(other) = equal?(other) || (other.instance_of?(Union) && hash == other.hash && members == other.members)
+    def eql?(other) = equal?(other) || (other.instance_of?(Union) && hash == other.hash && members.eql?(other.members))
+    def inspect = "#<data #{self.class.name} members=#{members.inspect}>"
+    alias to_s inspect
+  end
+
+  class Function
+    attr_reader :parameters, :result, :hash
+
+    def initialize(parameters, result)
+      @parameters = parameters.freeze
+      @result = result
+      @hash = parameters.hash ^ result.hash ^ 1
+      freeze
+    end
+
+    def ==(other)
+      equal?(other) ||
+        (other.instance_of?(Function) && hash == other.hash && parameters == other.parameters && result == other.result)
+    end
+
+    def eql?(other)
+      equal?(other) ||
+        (other.instance_of?(Function) && hash == other.hash && parameters.eql?(other.parameters) && result.eql?(other.result))
+    end
+
+    def inspect = "#<data #{self.class.name} parameters=#{parameters.inspect}, result=#{result.inspect}>"
+    alias to_s inspect
+  end
   Capability = Data.define(:receiver, :message, :arguments, :keywords, :result, :line)
+  # Most sends pass no keywords and most methods assign no ivars; sharing
+  # these keeps a few hundred thousand empty containers out of the live heap.
+  EMPTY_ARRAY = [].freeze
+  EMPTY_HASH = {}.freeze
   Parameter = Data.define(:name, :type, :kind)
   # A helper-type argument for consolidated definitions: a normalized slot
   # string whose T-references are filled from the occurrence's own arguments.
@@ -188,17 +283,23 @@ module Autotype
   # Type names that must not be treated as literal hash key strings.
   RESERVED_TYPE_NAMES = %w[String Symbol Integer Float Rational Complex bool nil Object].freeze
 
+  # Identity is equality: every (scope, id) pair is minted exactly once, so
+  # the default C-level hash/eql? stay correct and allocate nothing.
+  #
+  # Variables belong to one run, so the solver keeps its substitution on the
+  # variable itself (link) instead of in a table keyed by it, and clears it
+  # when solving ends. rebindable marks variables path compression must keep.
   class TypeVariable
     attr_reader :scope, :id, :hint
+    attr_accessor :link, :rebindable
 
     def initialize(scope, id, hint = nil)
       @scope = scope
       @id = id
       @hint = hint
+      @link = nil
+      @rebindable = false
     end
-
-    def eql?(other) = other.is_a?(TypeVariable) && scope.equal?(other.scope) && id == other.id
-    def hash = [scope.object_id, id].hash
   end
 
   class Analyzer
@@ -228,6 +329,9 @@ module Autotype
         parameters += [Parameter.new(name: :block, type: @yield_function, kind: :block)]
       end
 
+      # A name bound both at method level and inside blocks (e.g.
+      # `x = nil` reassigned within an each) carries both types.
+      locals = @block_locals.merge(@environment) { |_name, inner, outer| union(inner, outer) }
       MethodResult.new(
         name: qualified_name,
         owner: owner,
@@ -236,16 +340,14 @@ module Autotype
         superclass: superclass,
         line: node.location.start_line,
         end_line: node.location.end_line,
-        parameters: parameters,
+        parameters: parameters.empty? ? EMPTY_ARRAY : parameters,
         result: result,
         capabilities: capabilities,
         self_type: @self_type,
-        ivars: @ivars.dup,
-        # A name bound both at method level and inside blocks (e.g.
-        # `x = nil` reassigned within an each) carries both types.
-        locals: @block_locals.merge(@environment) { |_name, inner, outer| union(inner, outer) },
-        port_assignments: @port_assignments.dup,
-        case_narrowings: @case_narrowings.transform_values { |types| types.uniq }
+        ivars: @ivars.empty? ? EMPTY_HASH : @ivars.dup,
+        locals: locals.empty? ? EMPTY_HASH : locals,
+        port_assignments: @port_assignments.empty? ? EMPTY_ARRAY : @port_assignments.dup,
+        case_narrowings: @case_narrowings.empty? ? EMPTY_HASH : @case_narrowings.transform_values { |types| types.uniq }
       )
     end
 
@@ -489,8 +591,8 @@ module Autotype
       capabilities << Capability.new(
         receiver: receiver,
         message: node.name,
-        arguments: positional,
-        keywords: keywords,
+        arguments: positional.empty? ? EMPTY_ARRAY : positional,
+        keywords: keywords.empty? ? EMPTY_HASH : keywords,
         result: result,
         line: node.location.start_line
       )
@@ -505,8 +607,8 @@ module Autotype
         capabilities << Capability.new(
           receiver: value,
           message: :to_s,
-          arguments: [],
-          keywords: {},
+          arguments: EMPTY_ARRAY,
+          keywords: EMPTY_HASH,
           result: Named.new("String"),
           line: part.location.start_line
         )
@@ -1211,6 +1313,8 @@ module Autotype
       @constants = constants
       @namespaces = namespaces
       @values = {}
+      @lexical_candidates = {}
+      @constant_names = {}
     end
 
     # Recorded constants with aliases resolved, keyed like the collector's.
@@ -1229,36 +1333,42 @@ module Autotype
           unknowns[name] ||= TypeVariable.new(scope, unknowns.length, name.split("::").last.downcase)
         end
       end
+      parameters = method.parameters
       method.with(
-        parameters: method.parameters.map { |parameter| parameter.with(type: substitute.(parameter.type)) },
+        parameters: parameters.empty? ? parameters : parameters.map { |parameter| parameter.with(type: substitute.(parameter.type)) },
         result: substitute.(method.result),
         capabilities: method.capabilities.map do |capability|
+          arguments = capability.arguments
+          keywords = capability.keywords
           capability.with(
             receiver: constant_name(capability.receiver) ? capability.receiver : substitute.(capability.receiver),
-            arguments: capability.arguments.map(&substitute),
-            keywords: capability.keywords.transform_values(&substitute)
+            arguments: arguments.empty? ? arguments : arguments.map(&substitute),
+            keywords: keywords.empty? ? keywords : keywords.transform_values(&substitute)
           )
         end,
-        ivars: method.ivars.transform_values(&substitute),
-        locals: method.locals.transform_values(&substitute)
+        ivars: method.ivars.empty? ? method.ivars : method.ivars.transform_values(&substitute),
+        locals: method.locals.empty? ? method.locals : method.locals.transform_values(&substitute)
       )
     end
 
     private
 
-    def substitute_values(type, owner, visiting = Set.new, &unknown)
-      substitute = ->(inner) { substitute_values(inner, owner, visiting, &unknown) }
+    def substitute_values(type, owner, visiting = nil, &unknown)
       case type
       when Named
         name = constant_name(type)
         (name && value_type(name, owner, visiting, &unknown)) || type
       when Generic
-        Generic.new(type.name, type.arguments.map(&substitute))
+        Generic.new(type.name, type.arguments.map { |inner| substitute_values(inner, owner, visiting, &unknown) })
       when Union
-        members = type.members.map(&substitute).flat_map { _1.is_a?(Union) ? _1.members : [_1] }.uniq
+        members = type.members.map { |inner| substitute_values(inner, owner, visiting, &unknown) }
+        members = members.flat_map { _1.is_a?(Union) ? _1.members : [_1] }.uniq
         members.length == 1 ? members.first : Union.new(members)
       when Function
-        Function.new(type.parameters.map(&substitute), substitute.(type.result))
+        Function.new(
+          type.parameters.map { |inner| substitute_values(inner, owner, visiting, &unknown) },
+          substitute_values(type.result, owner, visiting, &unknown)
+        )
       else
         type
       end
@@ -1277,14 +1387,21 @@ module Autotype
 
     # Nearest enclosing namespace first, as Ruby's lexical lookup does.
     def lexical_candidates(name, owner)
-      return [name.delete_prefix("::")] if name.start_with?("::")
-
-      parts = owner.split("::")
-      parts.length.downto(0).map { |length| (parts.first(length) + [name]).join("::") }
+      memo = @lexical_candidates[owner] ||= {}
+      memo[name] ||= begin
+        if name.start_with?("::")
+          [name.delete_prefix("::")]
+        else
+          parts = owner.split("::")
+          parts.length.downto(0).map { |length| (parts.first(length) + [name]).join("::") }
+        end.freeze
+      end
     end
 
-    def recorded_value(qualified, visiting = Set.new)
+    def recorded_value(qualified, visiting = nil)
       return @values[qualified] if @values.key?(qualified)
+
+      visiting ||= Set.new
       return nil unless visiting.add?(qualified)
 
       value = substitute_values(@constants[qualified], qualified.rpartition("::").first, visiting)
@@ -1293,7 +1410,10 @@ module Autotype
     end
 
     def constant_name(type)
-      type.name[/\AClass\[(.+)\]\z/, 1] if type.is_a?(Named)
+      return unless type.is_a?(Named)
+
+      name = type.name
+      @constant_names.fetch(name) { @constant_names[name] = name[/\AClass\[(.+)\]\z/, 1].freeze }
     end
   end
 
@@ -1319,6 +1439,7 @@ module Autotype
     ).freeze
     ZERO_ARITY_READERS = %i[length size bytesize].to_set.freeze
     NORETURN = Named.new("noreturn")
+    NIL = Named.new("nil")
 
     attr_reader :iterations
 
@@ -1331,6 +1452,14 @@ module Autotype
         method.with(result: Named.new(method.owner))
       end
       @index = @methods.to_h { |method| [[method.owner, method.kind, method.method_name], method] }
+      @owners = @methods.to_set(&:owner)
+      @hierarchy_cache = {}
+      @named_owner_cache = {}
+      @receiver_targets = {}.compare_by_identity
+      @structured_names = {}
+      @union_elements = {}
+      @constant_literals = {}
+      @class_names = {}
       @superclasses = methods.filter_map do |method|
         [method.owner, method.superclass] if method.superclass
       end.to_h
@@ -1343,13 +1472,42 @@ module Autotype
 
         @duck_index[method.method_name] << method
       end
-      @substitutions = {}
+      # Bound variables, in binding order; their count bounds every chain.
+      @bound = []
+      # Variables compare by identity, so their tables do too.
+      @resolved = {}.compare_by_identity
+      @dependents = {}.compare_by_identity
+      # Skipping settled capabilities (see settled?): who read what, and who
+      # is clean as of which generation (with the duck unions it saw).
+      @readers = {}.compare_by_identity
+      @clean = {}.compare_by_identity
+      @generation = 0
+      @flushes = 0
+      @reads = nil
+      @read_buffer = {}.compare_by_identity
+      @union_states = {}.compare_by_identity
+      @wrote = false
+      @tracking_chains = false
+      @methods.each do |method|
+        mark_rebindable(method.result)
+        method.capabilities.each { |capability| mark_rebindable(capability.result) }
+      end
       @call_mappings = {}
+      @instantiated_parameters = {}
+      @instantiated_results = {}
+      @result_copies = {}
       @stable_variables = {}
       @fresh_scope = Object.new
       @fresh_id = 0
       @iterations = 0
       @converged = false
+      # What the current and previous solving pass bound, and where their
+      # minting started (see replayed_pass?).
+      @pass_binds = @previous_binds = nil
+      @pass_start = @previous_start = 0
+      @pass_stable = 0
+      @replay_escaped = nil
+      @scan = nil
     end
 
     def run
@@ -1382,6 +1540,9 @@ module Autotype
       apply_mutator_return_nil!
       apply_forced_return_conventions!
       @methods.map { |method| resolved_method(method) }
+    ensure
+      @bound.each { |variable| variable.link = nil }
+      @bound.clear
     end
 
     def converged? = @converged
@@ -1455,7 +1616,7 @@ module Autotype
           parameter = method.parameters.find { |candidate| candidate.name == name }
           next unless parameter
 
-          merged = types.reduce { |left, right| merge_union(left, right) }
+          merged = merge_unions(types)
           unify(parameter.type, merged) if merged
         end
       end
@@ -1497,11 +1658,12 @@ module Autotype
 
     def apply_output_emit_wiring!
       wiring = @metadata.output_emit
+      methods_by_owner = @methods.group_by(&:owner)
       @metadata.ports.each do |owner, ports|
         outputs = ports[:outputs]
         next if outputs.empty?
 
-        @methods.select { |method| method.owner == owner }.each do |method|
+        methods_by_owner.fetch(owner, []).each do |method|
           method.capabilities.each do |capability|
             next unless capability.message == wiring.message
             next unless capability.receiver == method.self_type
@@ -1710,8 +1872,13 @@ module Autotype
       structured_owner?(terminal.name)
     end
 
+    # The metadata stays fixed while solving.
+    def structured_name?(name)
+      @structured_names.fetch(name) { @structured_names[name] = @metadata.structured_type?(name) }
+    end
+
     def structured_owner?(owner)
-      return true if @metadata.structured_type?(owner)
+      return true if structured_name?(owner)
 
       init = @index[[owner, :instance, :initialize]]
       return false unless init
@@ -1733,30 +1900,30 @@ module Autotype
         return Generic.new("Hash", [Named.new("String"), Named.new("Object")])
       end
 
-      value_type = fields.values.reduce { |left, right| merge_union(left, right) }
+      value_type = merge_unions(fields.values)
       Generic.new("Hash", [Named.new("String"), value_type])
     end
 
     private
 
     def solve_to_fixed_point
+      next_replay_check = 1
+      replay_misses = 0
+      @scan = scan_order
       MAX_ITERATIONS.times do |iteration|
         @changed = false
         @duck_cache = {}
-        @methods.each do |method|
-          method.capabilities.each do |capability|
-            apply_builtin(method, capability)
-            # Anchor before resolving the target so a delegating `new`
-            # override cannot flood the call site with unresolved variables.
-            apply_constructor(method, capability)
-            target = resolve_target(method, capability)
-            if target
-              apply_method_call(method, capability, target)
-            elsif apply_union_member_dispatch(method, capability)
-              next
-            else
-              apply_duck_dispatch(method, capability)
-              apply_fallback(method, capability)
+        @previous_binds = @pass_binds
+        @previous_start = @pass_start
+        @pass_binds = []
+        @pass_start = @fresh_id
+        @pass_stable = @stable_variables.size
+        if @scan
+          scan_pass(@scan)
+        else
+          @methods.each do |method|
+            method.capabilities.each do |capability|
+              evaluate_tracked(method, capability) unless settled?(capability)
             end
           end
         end
@@ -1765,6 +1932,375 @@ module Autotype
           @converged = true
           break
         end
+        next if iteration < next_replay_check
+
+        case replayed_pass?
+        when true
+          # Every remaining pass would replay this one, binding again, so
+          # the loop would only have stopped at the cap.
+          @iterations = MAX_ITERATIONS
+          break
+        when :mismatch
+          replay_misses += 1
+          next_replay_check = iteration + (1 << replay_misses)
+        end
+      end
+    ensure
+      @pass_binds = @previous_binds = nil
+      @scan = nil
+    end
+
+    # A pass visits capabilities in method order and evaluates the unsettled
+    # ones. Skipping one that is clean as of this generation changes nothing
+    # (settled? only has effects for duck observations), so after a full
+    # sweep a pass only visits, in the same order, the capabilities that
+    # were not clean after their last visit or were unsettled since.
+    Scan = Struct.new(:capabilities, :methods, :positions, :current, :full, :pending, :queue, :extra)
+
+    # Capabilities only change between solving rounds. One listed twice
+    # shares its clean state between its positions, which a scan by
+    # position does not track.
+    def scan_order
+      capabilities = []
+      methods = []
+      @methods.each do |method|
+        method.capabilities.each do |capability|
+          capabilities << capability
+          methods << method
+        end
+      end
+      positions = {}.compare_by_identity
+      capabilities.each_with_index { |capability, position| positions[capability] = position }
+      return unless positions.size == capabilities.size
+
+      Scan.new(capabilities, methods, positions, -1, true, [], [], [])
+    end
+
+    def scan_pass(scan)
+      if scan.full
+        scan.pending.clear
+        sweep(scan, 0)
+      else
+        queue = scan.queue.replace(scan.pending.sort!.uniq)
+        scan.pending.clear
+        generation = @generation
+        last = -1
+        index = 0
+        extra = scan.extra
+        while index < queue.length || !extra.empty?
+          if extra.empty? || (index < queue.length && queue[index] < extra.first)
+            position = queue[index]
+            index += 1
+          else
+            position = heap_pop(extra)
+          end
+          next if position <= last
+
+          last = position
+          visit(scan, position)
+          next if @generation == generation
+
+          # Every clean capability went stale: sweep the rest of the pass.
+          extra.clear
+          sweep(scan, position + 1)
+          scan.full = true
+          break
+        end
+      end
+      scan.current = -1
+    end
+
+    def sweep(scan, from)
+      scan.full = true
+      generation = @generation
+      position = from
+      length = scan.capabilities.length
+      while position < length
+        visit(scan, position)
+        position += 1
+      end
+      scan.full = @generation != generation
+    end
+
+    def visit(scan, position)
+      scan.current = position
+      capability = scan.capabilities[position]
+      evaluate_tracked(scan.methods[position], capability) unless settled?(capability)
+      clean = @clean[capability]
+      scan.pending << position unless clean.instance_of?(Integer) && clean == @generation
+    end
+
+    # During a pass, a capability unsettled ahead of the scan is visited
+    # in this pass, and one behind it (or the one being evaluated) in the
+    # next.
+    def unsettle(capability)
+      @clean.delete(capability)
+      scan = @scan
+      return unless scan
+
+      position = scan.positions[capability]
+      return unless position
+
+      if position <= scan.current
+        scan.pending << position
+      elsif !scan.full
+        heap_push(scan.extra, position)
+      end
+    end
+
+    def heap_push(heap, value)
+      index = heap.length
+      heap << value
+      while index.positive?
+        parent = (index - 1) >> 1
+        break if heap[parent] <= value
+
+        heap[index] = heap[parent]
+        index = parent
+      end
+      heap[index] = value
+    end
+
+    def heap_pop(heap)
+      top = heap.first
+      last = heap.pop
+      return top if heap.empty?
+
+      index = 0
+      length = heap.length
+      loop do
+        child = (2 * index) + 1
+        break if child >= length
+
+        child += 1 if child + 1 < length && heap[child + 1] < heap[child]
+        break if heap[child] >= last
+
+        heap[index] = heap[child]
+        index = child
+      end
+      heap[index] = last
+      top
+    end
+
+    # Call cycles keep minting copies of copies, so a pass can bind again
+    # without telling the solver anything new: it only moves unbound ends
+    # onto variables it minted. Solving reads the state through resolved
+    # types, mapping lookups, and stable variables, never through variable
+    # identities beyond equality (see replayed_mappings? for the caches), so
+    # a pass from a state equal to the previous one up to renaming does the
+    # same, renamed. This holds when every older variable the pass bound now
+    # ends at its own unbound variable minted by the pass, and the call
+    # mappings it extended correspond to the ones it retired; then every
+    # later pass replays it and the final state, rendered by identity, is
+    # this one renamed. Rebindable variables keep their place on chains (see
+    # compress_path) and get rebound later, so they must not move at all;
+    # analyzer variables must not either, since rendering compares solved
+    # types against them.
+    def replayed_pass?
+      return false unless @stable_variables.size == @pass_stable
+
+      images = {}.compare_by_identity
+      preimages = {}.compare_by_identity
+      binds = @pass_binds
+      index = 0
+      while index < binds.length
+        variable = binds[index]
+        index += 2
+        next if pass_mint?(variable)
+        return false unless variable.scope.equal?(@fresh_scope) && !variable.rebindable
+
+        image = replay_end(variable)
+        return false unless image.is_a?(TypeVariable) && pass_mint?(image)
+        return false if image.link || preimages.key?(image)
+
+        images[variable] = image
+        preimages[image] = variable
+      end
+      replayed_mappings?(images, preimages) || :mismatch
+    end
+
+    # Mapping entries are only looked up by unbound variables, so an entry
+    # whose key the pass bound is retired and must reappear under the key's
+    # image with a copy that resolves alike; any other entry the pass added
+    # has no counterpart. The instantiation caches memoize these mappings
+    # and are skipped. Retired copies nothing ever bound into the state
+    # (see renamed_copy?) need not stay equal: they are out of reach.
+    def replayed_mappings?(images, preimages)
+      renaming = [{}.compare_by_identity, {}.compare_by_identity]
+      @call_mappings.each_value do |mapping|
+        mapping.each do |key, copy|
+          if (image = images[key])
+            next if pass_mint?(copy)
+
+            replacement = mapping[image]
+            return false unless replacement && replayed_copy?(replacement, copy, preimages, renaming)
+          elsif pass_mint?(copy) && !key.link
+            original = preimages[key]
+            return false unless original && (retired = mapping[original]) && !pass_mint?(retired)
+          end
+        end
+      end
+      true
+    ensure
+      @replay_escaped = nil
+    end
+
+    REPLAY_MATCH_BUDGET = 10_000
+
+    # Walks both copies' bound structure in step. Chains are followed to
+    # their end or first rebindable variable, which both must share.
+    # renaming holds the stand-ins chosen so far, both ways.
+    def replayed_copy?(replacement, retired, preimages, renaming)
+      stack = [replacement, retired]
+      budget = REPLAY_MATCH_BUDGET
+      until stack.empty?
+        old = stack.pop
+        new = stack.pop
+        return false if (budget -= 1).negative?
+        next if new.equal?(old)
+
+        new = replay_end(new)
+        old = replay_end(old)
+        next if new.equal?(old)
+
+        case new
+        when TypeVariable
+          return false unless old.is_a?(TypeVariable) && renamed_copy?(new, old, preimages, renaming)
+        when Generic
+          return false unless old.is_a?(Generic) && old.name == new.name && old.arguments.length == new.arguments.length
+
+          new.arguments.each_with_index { |argument, position| stack << argument << old.arguments[position] }
+        when Union
+          return false unless old.is_a?(Union) && old.members.length == new.members.length
+
+          new.members.each_with_index { |member, position| stack << member << old.members[position] }
+        when Function
+          return false unless old.is_a?(Function) && old.parameters.length == new.parameters.length
+
+          new.parameters.each_with_index { |parameter, position| stack << parameter << old.parameters[position] }
+          stack << new.result << old.result
+        else
+          return false unless new == old
+        end
+      end
+      true
+    end
+
+    # A copy minted last pass that no bind ever referenced is reachable only
+    # through its own mapping entry; once that entry retires, a new unbound
+    # copy may stand in for it, one for one.
+    def renamed_copy?(new, old, preimages, renaming)
+      forward, backward = renaming
+      return forward[new].equal?(old) if forward.key?(new)
+      return false if new.rebindable || old.rebindable
+      return false if new.link || old.link
+      return false unless pass_mint?(new) && !preimages.key?(new) && previous_pass_mint?(old)
+      return false if backward.key?(old) || replay_escaped.key?(old)
+
+      forward[new] = old
+      backward[old] = new
+    end
+
+    def replay_escaped
+      @replay_escaped ||= begin
+        referenced = {}.compare_by_identity
+        stack = []
+        [@previous_binds, @pass_binds].each do |binds|
+          index = 1
+          while index < binds.length
+            stack << binds[index]
+            index += 2
+          end
+        end
+        until stack.empty?
+          node = stack.pop
+          case node
+          when TypeVariable then referenced[node] = true
+          when Generic then stack.concat(node.arguments)
+          when Union then stack.concat(node.members)
+          when Function then stack.concat(node.parameters) << node.result
+          end
+        end
+        referenced
+      end
+    end
+
+    def replay_end(type)
+      steps = 0
+      while type.is_a?(TypeVariable) && !type.rebindable && (bound = type.link)
+        return type if (steps += 1) > @bound.size
+
+        type = bound
+      end
+      type
+    end
+
+    def pass_mint?(variable)
+      variable.scope.equal?(@fresh_scope) && variable.id >= @pass_start
+    end
+
+    def previous_pass_mint?(variable)
+      variable.scope.equal?(@fresh_scope) && variable.id >= @previous_start && variable.id < @pass_start
+    end
+
+    # Evaluating a capability is deterministic in the state it reads. One
+    # whose last evaluation wrote nothing, and nothing it read has changed
+    # since, would write nothing again, so skipping it leaves every pass's
+    # sequence of bindings exactly as a full sweep makes it.
+    def settled?(capability)
+      clean = @clean[capability]
+      return clean == @generation unless clean.instance_of?(DuckClean)
+      return false unless clean.generation == @generation
+
+      # The duck cache is rebuilt each pass on first use, so its entries are
+      # fetched here, where this capability would have asked for them.
+      clean.observations.all? { |message, union| duck_union(message) == union }
+    end
+
+    # A clean capability's generation, with the duck unions it saw if any.
+    DuckClean = Struct.new(:generation, :observations)
+
+    # Clearing a hash costs its peak capacity, so a buffer that one
+    # evaluation grew is replaced rather than cleared for every later one.
+    READ_BUFFER_LIMIT = 64
+
+    def evaluate_tracked(method, capability)
+      buffer = @read_buffer
+      @reads = buffer.size > READ_BUFFER_LIMIT ? (@read_buffer = {}.compare_by_identity) : buffer.clear
+      @duck_seen = nil
+      @wrote = false
+      evaluate(method, capability)
+      reads = @reads
+      @reads = nil
+      if @wrote
+        @clean.delete(capability)
+      else
+        @clean[capability] = @duck_seen ? DuckClean.new(@generation, @duck_seen) : @generation
+        readers = @readers
+        reads.each_key do |source|
+          list = readers[source]
+          if list.nil?
+            readers[source] = capability
+          elsif list.instance_of?(Array)
+            list << capability unless list.last.equal?(capability)
+          elsif !list.equal?(capability)
+            readers[source] = [list, capability]
+          end
+        end
+      end
+    end
+
+    def evaluate(method, capability)
+      apply_builtin(method, capability)
+      # Anchor before resolving the target so a delegating `new`
+      # override cannot flood the call site with unresolved variables.
+      apply_constructor(method, capability)
+      target = resolve_target(method, capability)
+      if target
+        apply_method_call(method, capability, target)
+      elsif !apply_union_member_dispatch(method, capability)
+        apply_duck_dispatch(method, capability)
+        apply_fallback(method, capability)
       end
     end
 
@@ -1791,7 +2327,7 @@ module Autotype
           resolved = resolve(type)
           resolved unless resolved.is_a?(TypeVariable)
         end
-        merged = observed.reduce { |left, right| merge_union(left, right) }
+        merged = merge_unions(observed)
         next unless merged
 
         types.each do |type|
@@ -1973,7 +2509,7 @@ module Autotype
           unify(result, entity_hash_type(owner))
         elsif receiver.is_a?(Union)
           hash_types = receiver.members.filter_map { |member| structured_owner_name(member) }.map { |name| entity_hash_type(name) }
-          unify(result, hash_types.reduce { |left, right| merge_union(left, right) }) if hash_types.any?
+          unify(result, merge_unions(hash_types)) if hash_types.any?
         elsif structured_owner?(method.owner) || structured_type?(receiver, method)
           unify(result, entity_hash_type(method.owner))
         elsif hash?(receiver)
@@ -2235,7 +2771,13 @@ module Autotype
       end
     end
 
+    # The constant table is fixed once solving starts.
     def constant_literal(name, lexical_owner)
+      memo = @constant_literals[lexical_owner] ||= {}
+      memo.fetch(name) { memo[name] = find_constant_literal(name, lexical_owner) }
+    end
+
+    def find_constant_literal(name, lexical_owner)
       constant = name.delete_prefix("::")
       return @constants[constant] if name.start_with?("::")
 
@@ -2264,7 +2806,7 @@ module Autotype
       targets = receiver.members.filter_map do |member|
         terminal = dereference(member)
         next unless terminal.is_a?(Named)
-        next unless @metadata.structured_type?(terminal.name)
+        next unless structured_name?(terminal.name)
 
         resolve_named_owner(terminal.name, method.owner, :instance, capability.message)
       end
@@ -2279,19 +2821,15 @@ module Autotype
     end
 
     def apply_union_method_call(caller, capability, callees)
+      # A union unifies with nothing but an unbound variable.
+      inert = !dereference(capability.result).is_a?(TypeVariable)
       returns = callees.map do |callee|
         key = [caller.object_id, capability.object_id, callee.object_id]
-        mapping = @call_mappings[key] ||= {}
-        instantiated_parameters = callee.parameters.map do |parameter|
-          Parameter.new(
-            name: parameter.name,
-            type: instantiate(resolve(parameter.type), mapping),
-            kind: parameter.kind
-          )
-        end
-        bind_arguments(instantiated_parameters, capability)
-        instantiate(resolve(callee.result), mapping)
+        bind_arguments(instantiated_parameters(key, callee), capability)
+        instantiated_result(key, callee) unless inert
       end
+      return if inert
+
       unified = returns.reduce { |left, right| Union.new([left, right].uniq) }
       unify(capability.result, unified)
     end
@@ -2317,18 +2855,28 @@ module Autotype
     # per solving iteration. Unresolved definitions are excluded: the ground
     # subset is the best evidence available either way.
     def duck_union(message)
-      @duck_cache.fetch(message) do
-        ground = @duck_index[message]
-          .map { |candidate| resolve(candidate.result) }
-          .select { |type| ground?(type) }
-          .uniq
-        @duck_cache[message] =
-          if ground.empty? || ground.length > DUCK_UNION_LIMIT
-            nil
-          else
-            ground.length == 1 ? ground.first : Union.new(ground)
-          end
-      end
+      union = @duck_cache.fetch(message) { @duck_cache[message] = untracked { compute_duck_union(message) } }
+      # Readers depend on the union itself, which settled? compares each pass.
+      (@duck_seen ||= []) << [message, union] if @reads
+      union
+    end
+
+    def compute_duck_union(message)
+      ground = @duck_index[message]
+        .map { |candidate| resolve(candidate.result) }
+        .select { |type| ground?(type) }
+        .uniq
+      return nil if ground.empty? || ground.length > DUCK_UNION_LIMIT
+
+      ground.length == 1 ? ground.first : Union.new(ground)
+    end
+
+    def untracked
+      reads = @reads
+      @reads = nil
+      yield
+    ensure
+      @reads = reads
     end
 
     # A call's effective callee: hierarchy resolution first, then the duck
@@ -2347,7 +2895,7 @@ module Autotype
       when TypeVariable, Union
         true
       when Named
-        return true if @metadata.structured_type?(receiver.name)
+        return true if structured_name?(receiver.name)
         !DUCK_CORE_RECEIVERS.include?(receiver.name) && !receiver.name.start_with?("Class[")
       else
         false
@@ -2358,7 +2906,7 @@ module Autotype
     # suffix convention is reliable enough for a typedoc, and a bare
     # `new`/`create` inside a singleton method constructs the owner class.
     def apply_fallback(method, capability)
-      unify(capability.result, Named.new("bool")) if capability.message.to_s.end_with?("?")
+      unify(capability.result, Named.new("bool")) if capability.message.end_with?("?")
       return unless capability.receiver == method.self_type
 
       # Rails controller/framework conventions for self-sends that resolve
@@ -2417,17 +2965,26 @@ module Autotype
       unify(capability.result, Named.new(method.owner))
     end
 
+    # The single member that is neither nil nor noreturn, if there is one.
     def unwrap_nilable(type)
       return type unless type.is_a?(Union)
 
-      members = type.members.reject { |member| [Named.new("nil"), NORETURN].include?(member) }
-      members.length == 1 ? members.first : type
+      found = false
+      single = nil
+      type.members.each do |member|
+        next if member == NIL || member == NORETURN
+        return type if found
+
+        found = true
+        single = member
+      end
+      found ? single : type
     end
 
     def strip_nil(type)
       return type unless type.is_a?(Union)
 
-      members = type.members.reject { |member| member == Named.new("nil") }
+      members = type.members.reject { |member| member == NIL }
       case members.length
       when 0 then type
       when 1 then members.first
@@ -2465,7 +3022,7 @@ module Autotype
         hash?(type) ? type.arguments[1] : nil
       when Union
         values = type.members.filter_map { |member| hash_value_type(member) }
-        values.reduce { |left, right| merge_union(left, right) }
+        merge_unions(values)
       end
     end
 
@@ -2518,20 +3075,38 @@ module Autotype
       unify(result, receiver)
     end
 
+    # A send's target only changes when its receiver resolves differently,
+    # and resolution hands back the same object until then, so the last
+    # target is kept with the receiver it was found for.
     def resolve_target(method, capability)
       if capability.receiver == method.self_type
         resolve_in_hierarchy(method.owner, method.kind, capability.message)
       else
         receiver = resolve(capability.receiver)
-        if (class_name = class_name_from(receiver))
-          resolve_named_owner(class_name, method.owner, :singleton, capability.message)
-        elsif receiver.is_a?(Named)
-          resolve_named_owner(receiver.name, method.owner, :instance, capability.message)
-        end
+        return unless receiver.is_a?(Named)
+
+        cached = @receiver_targets[capability]
+        return cached[2] if cached && cached[0].equal?(receiver) && cached[1].equal?(method)
+
+        target =
+          if (class_name = class_name_from(receiver))
+            resolve_named_owner(class_name, method.owner, :singleton, capability.message)
+          else
+            resolve_named_owner(receiver.name, method.owner, :instance, capability.message)
+          end
+        @receiver_targets[capability] = [receiver, method, target]
+        target
       end
     end
 
+    # Hierarchy lookups only read tables fixed at construction, and dispatch
+    # repeats them for every send on every pass.
     def resolve_in_hierarchy(owner, kind, method_name)
+      memo = (@hierarchy_cache[owner] ||= {})[kind] ||= {}
+      memo.fetch(method_name) { memo[method_name] = find_in_hierarchy(owner, kind, method_name) }
+    end
+
+    def find_in_hierarchy(owner, kind, method_name)
       current = owner
       visited = Set.new
       while current && !visited.include?(current)
@@ -2550,6 +3125,11 @@ module Autotype
     end
 
     def resolve_named_owner(name, lexical_owner, kind, method_name)
+      memo = ((@named_owner_cache[name] ||= {})[lexical_owner] ||= {})[kind] ||= {}
+      memo.fetch(method_name) { memo[method_name] = find_named_owner(name, lexical_owner, kind, method_name) }
+    end
+
+    def find_named_owner(name, lexical_owner, kind, method_name)
       constant = name.delete_prefix("::")
       candidates = [constant]
       unless name.start_with?("::")
@@ -2587,19 +3167,19 @@ module Autotype
     end
 
     def module_defined?(name)
-      @index.keys.any? { |(owner, _, _)| owner == name }
+      @owners.include?(name)
     end
 
     def resolve_superclass(owner, superclass)
       return nil unless superclass
 
       superclass = superclass.delete_prefix("::")
-      return superclass if @methods.any? { |method| method.owner == superclass }
+      return superclass if @owners.include?(superclass)
 
       namespace = owner.split("::")[0...-1]
       namespace.length.downto(0) do |length|
         candidate = (namespace.first(length) + [superclass]).join("::")
-        return candidate if @methods.any? { |method| method.owner == candidate }
+        return candidate if @owners.include?(candidate)
       end
       superclass
     end
@@ -2615,16 +3195,84 @@ module Autotype
       end
 
       key = [caller.object_id, capability.object_id, callee.object_id]
-      mapping = @call_mappings[key] ||= {}
-      instantiated_parameters = callee.parameters.map do |parameter|
-        Parameter.new(
-          name: parameter.name,
-          type: instantiate(resolve(parameter.type), mapping),
-          kind: parameter.kind
-        )
+      bind_arguments(instantiated_parameters(key, callee), capability)
+      return if instance_unify_inert?(capability.result, resolve(callee.result), @call_mappings[key])
+
+      unify(capability.result, instantiated_result(key, callee))
+    end
+
+    # Whether unify(target, instantiate(source, mapping)) would bind nothing,
+    # so the copy need not be built. Unification only descends through
+    # matching generics and functions; the walk follows that skeleton and
+    # gives up at any variable on either side. Skipping leaves only the call
+    # site's own caches behind, and fresh variables nothing else can see.
+    def instance_unify_inert?(target, source, mapping)
+      left = dereference(target)
+      return false if left.is_a?(TypeVariable)
+
+      case source
+      when TypeVariable
+        mapped = mapping&.[](source)
+        mapped ? unify_inert?(left, mapped) : false
+      when Generic
+        return true unless left.is_a?(Generic) && left.name == source.name && left.arguments.length == source.arguments.length
+
+        left.arguments.each_with_index.all? { |argument, index| instance_unify_inert?(argument, source.arguments[index], mapping) }
+      when Function
+        return true unless left.is_a?(Function) && left.parameters.length == source.parameters.length
+
+        left.parameters.each_with_index.all? { |parameter, index| instance_unify_inert?(parameter, source.parameters[index], mapping) } &&
+          instance_unify_inert?(left.result, source.result, mapping)
+      else
+        true
       end
-      bind_arguments(instantiated_parameters, capability)
-      unify(capability.result, instantiate(resolve(callee.result), mapping))
+    end
+
+    # Whether unify(left, right) on existing terms would bind nothing.
+    def unify_inert?(left, right)
+      left = dereference(left)
+      right = dereference(right)
+      return true if left.equal?(right)
+      return false if left.is_a?(TypeVariable) || right.is_a?(TypeVariable)
+
+      if left.is_a?(Generic) && right.is_a?(Generic) && left.name == right.name && left.arguments.length == right.arguments.length
+        left.arguments.each_with_index.all? { |argument, index| unify_inert?(argument, right.arguments[index]) }
+      elsif left.is_a?(Function) && right.is_a?(Function) && left.parameters.length == right.parameters.length
+        left.parameters.each_with_index.all? { |parameter, index| unify_inert?(parameter, right.parameters[index]) } &&
+          unify_inert?(left.result, right.result)
+      else
+        true
+      end
+    end
+
+    # A call site's mapping persists and variables compare by identity, so an
+    # equal resolved type instantiates to the same copy; reuse it instead of
+    # rebuilding it every pass. The result is resolved after arguments bind.
+    def instantiated_parameters(key, callee)
+      resolved = callee.parameters.map { |parameter| resolve(parameter.type) }
+      cached = @instantiated_parameters[key]
+      return cached.last if cached && cached.first == resolved
+
+      mapping = @call_mappings[key] ||= {}.compare_by_identity
+      parameters = callee.parameters.each_with_index.map do |parameter, index|
+        Parameter.new(name: parameter.name, type: instantiate(resolved[index], mapping), kind: parameter.kind)
+      end
+      @instantiated_parameters[key] = [resolved, parameters]
+      parameters
+    end
+
+    def instantiated_result(key, callee)
+      resolved = resolve(callee.result)
+      cached = @instantiated_results[key]
+      return cached.last if cached && cached.first == resolved
+
+      # Callee types change piecemeal, so subtrees copied last time are reused
+      # by identity rather than copying the whole type again.
+      copies = {}.compare_by_identity
+      result = instantiate(resolved, @call_mappings[key] ||= {}.compare_by_identity, copies, @result_copies[key])
+      @result_copies[key] = copies
+      @instantiated_results[key] = [resolved, result]
+      result
     end
 
     def bind_arguments(parameters, capability)
@@ -2658,21 +3306,33 @@ module Autotype
       end
     end
 
-    def instantiate(type, mapping)
-      case type
-      when TypeVariable
+    # Callers pass resolved types, whose unions are already duplicate-free, and
+    # the renaming is injective, so instantiated unions need no dedupe. A
+    # subtree's copy only depends on the mapping, which never forgets, so
+    # copies made earlier at the same call site (previous) stay valid.
+    def instantiate(type, mapping, copies = nil, previous = nil)
+      if type.is_a?(Generic) || type.is_a?(Union) || type.is_a?(Function)
+        return instantiate_composite(type, mapping, nil, nil) unless copies
+
+        copies[type] || (copies[type] = previous&.[](type) || instantiate_composite(type, mapping, copies, previous))
+      elsif type.is_a?(TypeVariable)
         mapping[type] ||= fresh(type.hint)
-      when Generic
-        Generic.new(type.name, type.arguments.map { |argument| instantiate(argument, mapping) })
-      when Union
-        Union.new(type.members.map { |member| instantiate(member, mapping) }.uniq)
-      when Function
-        Function.new(
-          type.parameters.map { |parameter| instantiate(parameter, mapping) },
-          instantiate(type.result, mapping)
-        )
       else
         type
+      end
+    end
+
+    def instantiate_composite(type, mapping, copies, previous)
+      case type
+      when Generic
+        Generic.new(type.name, type.arguments.map { |argument| instantiate(argument, mapping, copies, previous) })
+      when Union
+        Union.new(type.members.map { |member| instantiate(member, mapping, copies, previous) })
+      else
+        Function.new(
+          type.parameters.map { |parameter| instantiate(parameter, mapping, copies, previous) },
+          instantiate(type.result, mapping, copies, previous)
+        )
       end
     end
 
@@ -2700,14 +3360,20 @@ module Autotype
     def bind(variable, type)
       return if occurs?(variable, type)
 
-      @substitutions[variable] = type
+      rebinding = !variable.link.nil?
+      link(variable, type)
+      @wrote = true
+      rebinding && !@tracking_chains ? flush_resolved : invalidate(variable)
       # Variable-to-variable links are alpha-moves carrying no new concrete
       # information. Counting them as progress lets recursive call cycles
       # mint fresh-variable chains that never converge.
       @changed = true unless type.is_a?(TypeVariable)
+      @pass_binds&.push(variable, type)
     end
 
     def occurs?(variable, type)
+      return false if type.is_a?(Named)
+
       type = dereference(type)
       case type
       when TypeVariable
@@ -2715,7 +3381,17 @@ module Autotype
       when Generic
         type.arguments.any? { |argument| occurs?(variable, argument) }
       when Union
-        type.members.any? { |member| occurs?(variable, member) }
+        # Unions run tens of thousands wide, nearly all Named.
+        members = type.members
+        index = 0
+        length = members.length
+        while index < length
+          member = members[index]
+          return true if !member.is_a?(Named) && occurs?(variable, member)
+
+          index += 1
+        end
+        false
       when Function
         type.parameters.any? { |parameter| occurs?(variable, parameter) } || occurs?(variable, type.result)
       else
@@ -2723,35 +3399,410 @@ module Autotype
       end
     end
 
+    def link(variable, type)
+      @bound << variable unless variable.link
+      variable.link = type
+    end
+
     def dereference(type)
-      seen = Set.new
-      while type.is_a?(TypeVariable) && @substitutions.key?(type) && !seen.include?(type)
-        seen << type
-        type = @substitutions.fetch(type)
+      return type unless type.is_a?(TypeVariable)
+
+      current = type
+      steps = 0
+      while (bound = current.link)
+        return dereference_guarded(type) if (steps += 1) > @bound.size
+
+        current = bound
+        break unless current.is_a?(TypeVariable)
       end
+      compress_path(type, current) if steps > 1
+      @reads[current] = true if @reads && current.is_a?(TypeVariable)
+      current
+    end
+
+    # Method and call results get rebound in place (force_return!,
+    # reflow_callee_returns!), so path compression must not skip over them.
+    def mark_rebindable(type)
+      type.rebindable = true if type.is_a?(TypeVariable)
+    end
+
+    # Alpha-links grow chains long enough to make every lookup linear. Each
+    # link is pointed at the terminal, but never past a rebindable variable,
+    # so a later rebinding still reaches everything behind it.
+    def compress_path(type, terminal)
+      path = []
+      current = type
+      until current.equal?(terminal)
+        path << current
+        current = current.link
+      end
+      target = terminal
+      path.reverse_each do |variable|
+        variable.link = target
+        target = variable if variable.rebindable
+      end
+    end
+
+    # A chain longer than the substitution table is a cycle; bind's occurs
+    # check should make that impossible, but a cycle must not hang the solver.
+    def dereference_guarded(type)
+      seen = Set.new
+      while type.is_a?(TypeVariable) && type.link && !seen.include?(type)
+        seen << type
+        type = type.link
+      end
+      @reads[type] = true if @reads && type.is_a?(TypeVariable)
       type
     end
 
+    # A call cycle re-instantiates a union of unknowns with fresh variables
+    # every round, doubling it without bound. Unknowns all render as Object,
+    # so only the oldest few are kept; that also stops the fresh minting.
+    MAX_UNION_UNKNOWNS = 32
+
+    # A resolution only goes stale when an unbound variable it reached gets
+    # bound, so binding drops just the entries derived from that variable
+    # (see invalidate). Rebinding an already-bound variable flushes everything.
+    # A reader only records the entry it asked for: invalidation reaches that
+    # entry from every variable beneath it, so the work below goes untracked.
+    # Named types resolve to themselves and nothing depends on them.
     def resolve(type)
-      type = dereference(type)
+      return type if type.is_a?(Named)
+
+      reads = @reads
+      return resolve_entry(type) unless reads
+
+      reads[type] = true if changeable?(type)
+      @reads = nil
+      begin
+        resolve_entry(type)
+      ensure
+        @reads = reads
+      end
+    end
+
+    def resolve_entry(type)
+      cached = @resolved[type]
+      return cached if cached
+
+      terminal = dereference(type)
+      result = resolve_terminal(terminal)
+      @resolved[type] = result
+      track_sources(type, terminal)
+      result
+    end
+
+    # An entry derives from the unbound variable it resolved to, or from the
+    # entries of its parts: every part, so members the union cap dropped
+    # still invalidate it once they bind.
+    def track_sources(type, terminal)
+      track_rebindable_chain(type) if @tracking_chains && !terminal.equal?(type)
+      case terminal
+      when TypeVariable then depend(terminal, type)
+      when Generic then terminal.arguments.each { |argument| depend(argument, type) }
+      when Union
+        # A big union's state was just brought up to date, and stands in for
+        # its members (see UnionState).
+        if (state = @union_states[terminal.members])
+          register(@dependents, state, type)
+        else
+          terminal.members.each { |member| depend(member, type) unless member.is_a?(Named) }
+        end
+      when Function
+        terminal.parameters.each { |parameter| depend(parameter, type) }
+        depend(terminal.result, type)
+      end
+    end
+
+    # Path compression never skips a rebindable variable, so every one the
+    # entry's resolution went through is still on its chain.
+    def track_rebindable_chain(type)
+      current = type
+      steps = 0
+      while current.is_a?(TypeVariable) && (bound = current.link) && (steps += 1) <= @bound.size
+        depend(current, type) if current.rebindable
+        current = bound
+      end
+    end
+
+    def depend(source, dependent)
+      return unless changeable?(source)
+
+      list = @dependents[source]
+      if list.nil?
+        @dependents[source] = dependent
+      elsif list.instance_of?(Array)
+        list << dependent unless list.last.equal?(dependent)
+      elsif !list.equal?(dependent)
+        @dependents[source] = [list, dependent]
+      end
+    end
+
+    # Most sources only ever get one dependent (or reader), stored bare;
+    # neither is ever an Array. Recomputing an entry re-registers it under
+    # sources that never changed, usually right after its last registration.
+    def register(table, source, dependent)
+      list = table[source]
+      if list.nil?
+        table[source] = dependent
+      elsif list.instance_of?(Array)
+        list << dependent unless list.last.equal?(dependent)
+      elsif !list.equal?(dependent)
+        table[source] = [list, dependent]
+      end
+    end
+
+    def changeable?(type)
+      type.is_a?(TypeVariable) || type.is_a?(Generic) || type.is_a?(Union) || type.is_a?(Function)
+    end
+
+    # An entry missing from the cache has no cached dependents left: they
+    # were dropped with it, or recomputed it when they were rebuilt. Every
+    # capability that read a dropped entry must be evaluated again.
+    def invalidate(source)
+      readers = @readers.delete(source)
+      if readers.instance_of?(Array)
+        readers.each { |capability| unsettle(capability) }
+      elsif readers
+        unsettle(readers)
+      end
+      dependents = @dependents.delete(source)
+      if dependents.instance_of?(Array)
+        dependents.each { |dependent| invalidate_dependent(dependent, source) }
+      elsif dependents
+        invalidate_dependent(dependents, source)
+      end
+    end
+
+    def invalidate_dependent(dependent, source)
+      if @resolved.delete(dependent)
+        invalidate(dependent)
+      elsif dependent.is_a?(UnionState)
+        dependent.dirty[source] = true
+        invalidate(dependent)
+      end
+    end
+
+    def flush_resolved
+      @resolved.clear
+      @dependents.clear
+      @readers.clear
+      @generation += 1
+      @flushes += 1
+    end
+
+    # Unchanged types come back as the same object, which keeps them
+    # allocation-free and lets call sites detect an unchanged callee by identity.
+    def resolve_terminal(type)
       case type
       when Generic
-        Generic.new(type.name, type.arguments.map { |argument| resolve(argument) })
+        arguments = resolve_each(type.arguments)
+        arguments.equal?(type.arguments) ? type : Generic.new(type.name, arguments)
       when Union
-        members = type.members.flat_map do |member|
-          resolved = resolve(member)
-          resolved.is_a?(Union) ? resolved.members : resolved
-        end.uniq
-        # Raising branches contribute no value, so noreturn disappears from
-        # unions unless the method can only raise.
-        live = members.reject { |member| member == NORETURN }
-        members = live unless live.empty?
-        members.length == 1 ? members.first : Union.new(members)
+        members = normalized_members(type.members)
+        return members.first if members.length == 1
+        return type if identical_elements?(members, type.members)
+
+        Union.new(members)
       when Function
-        Function.new(type.parameters.map { |parameter| resolve(parameter) }, resolve(type.result))
+        parameters = resolve_each(type.parameters)
+        result = resolve(type.result)
+        parameters.equal?(type.parameters) && result.equal?(type.result) ? type : Function.new(parameters, result)
       else
         type
       end
+    end
+
+    # Members resolved and flattened one level, first occurrences kept (as
+    # uniq keeps them), in a single pass. Named types resolve to themselves.
+    def normalized_members(source)
+      return incremental_members(source) if source.length > MAX_UNION_UNKNOWNS
+
+      seen = {}
+      source.each do |member|
+        resolved = member.is_a?(Named) ? member : resolve(member)
+        if resolved.is_a?(Union)
+          resolved.members.each { |inner| seen[inner] = true }
+        else
+          seen[resolved] = true
+        end
+      end
+      # Raising branches contribute no value, so noreturn disappears from
+      # unions unless the method can only raise.
+      seen.delete(NORETURN) if seen.size > 1
+      cap_unknowns(seen.keys)
+    end
+
+    def cap_unknowns(members)
+      return members unless members.length > MAX_UNION_UNKNOWNS
+
+      unknowns = 0
+      members.select { |member| !member.is_a?(TypeVariable) || (unknowns += 1) <= MAX_UNION_UNKNOWNS }
+    end
+
+    # Big unions are re-resolved each time one of their members binds, which
+    # usually changes a single position. While a union's last resolution
+    # needed no flattening, deduplication, or capping, it is kept as a
+    # UnionState, and a re-resolution that keeps it that way only examines
+    # the positions whose members were invalidated since.
+    def incremental_members(source)
+      state = @union_states[source]
+      if state
+        members = advance_union_state(state, source)
+        return members if members
+      end
+
+      settle_union_state(source, source.map { |member| member.is_a?(Named) ? member : resolve(member) })
+    end
+
+    # A big union's last clean resolution. It sits in the dependency graph
+    # between the union's members and the entries resolved through it: a
+    # member's invalidation reaches those entries through the state and marks
+    # the member dirty. A member that is not dirty still resolves to the
+    # cached entry recorded here, unless a flush dropped every entry.
+    class UnionState
+      attr_accessor :resolved, :unknowns, :flushes
+      # index: resolved member => position. watched: positions of members
+      # that are not Named, the only ones that can change. positions: their
+      # members => position.
+      attr_reader :index, :watched, :positions, :dirty
+
+      def initialize(resolved, index, unknowns, watched, flushes)
+        @resolved = resolved
+        @index = index
+        @unknowns = unknowns
+        @watched = watched
+        @flushes = flushes
+        @positions = {}.compare_by_identity
+        @dirty = {}.compare_by_identity
+      end
+    end
+
+    NO_POSITIONS = [].freeze
+
+    # Returns nil when the new resolution needs the full normalization.
+    def advance_union_state(state, source)
+      previous = state.resolved
+      stale = stale_positions(state)
+      changed = nil
+      stale.each do |position|
+        value = resolve(source[position])
+        (changed ||= {})[position] = value unless value.equal?(previous[position])
+      end
+      resolved = changed ? apply_union_changes(state, changed) : previous
+      return unless resolved
+
+      # Invalidation and flushes dropped the stale members' registrations.
+      stale.each { |position| depend(source[position], state) }
+      state.flushes = @flushes
+      resolved
+    end
+
+    # In position order, as a full scan meets them.
+    def stale_positions(state)
+      dirty = state.dirty
+      if state.flushes != @flushes
+        dirty.clear
+        state.watched
+      elsif dirty.empty?
+        NO_POSITIONS
+      else
+        positions = dirty.each_key.map { |member| state.positions.fetch(member) }.sort!
+        dirty.clear
+        positions
+      end
+    end
+
+    def apply_union_changes(state, changed)
+      previous = state.resolved
+      index = state.index
+      unknowns = state.unknowns
+      incoming = {} if changed.size > 1
+      changed.each do |position, value|
+        return nil if value.is_a?(Union) || value.eql?(NORETURN)
+
+        other = index[value]
+        return nil if other && other != position && !changed.key?(other)
+
+        if incoming
+          return nil if incoming.key?(value)
+
+          incoming[value] = true
+        end
+        unknowns += 1 if value.is_a?(TypeVariable)
+        unknowns -= 1 if previous[position].is_a?(TypeVariable)
+      end
+      return nil if unknowns > MAX_UNION_UNKNOWNS
+
+      resolved = previous.dup
+      changed.each_key { |position| index.delete(previous[position]) }
+      changed.each do |position, value|
+        index[value] = position
+        resolved[position] = value
+      end
+      state.resolved = resolved.freeze
+      state.unknowns = unknowns
+      resolved
+    end
+
+    def settle_union_state(source, resolved)
+      seen = {}
+      flattened = false
+      resolved.each_with_index do |value, position|
+        if value.is_a?(Union)
+          flattened = true
+          value.members.each { |inner| seen[inner] = true }
+        else
+          seen[value] = position
+        end
+      end
+      seen.delete(NORETURN) if seen.size > 1
+      members = seen.keys
+      if !flattened && members.length == resolved.length
+        unknowns = members.count { |member| member.is_a?(TypeVariable) }
+        if unknowns <= MAX_UNION_UNKNOWNS
+          watched = source.each_index.reject { |position| source[position].is_a?(Named) }
+          state = UnionState.new(resolved.freeze, seen, unknowns, watched, @flushes)
+          watched.each do |position|
+            state.positions[source[position]] = position
+            depend(source[position], state)
+          end
+          @union_states[source] = state
+          return resolved
+        end
+      end
+
+      @union_states.delete(source)
+      cap_unknowns(members)
+    end
+
+    def resolve_each(types)
+      resolved = nil
+      index = 0
+      length = types.length
+      while index < length
+        type = types[index]
+        result = resolve(type)
+        if resolved
+          resolved << result
+        elsif !result.equal?(type)
+          resolved = types.first(index) << result
+        end
+        index += 1
+      end
+      resolved || types
+    end
+
+    def identical_elements?(left, right)
+      return false unless left.length == right.length
+
+      index = 0
+      while index < left.length
+        return false unless left[index].equal?(right[index])
+
+        index += 1
+      end
+      true
     end
 
     MAX_NARROWING_SENDS = 8
@@ -3045,7 +4096,15 @@ module Autotype
     # Call-site return types can be bound while callees still carry stale
     # intermediate variables (e.g. `<<` before array element narrowing).
     # Re-unify once callees have converged.
+    #
+    # Nearly every bind here rebinds a call result. Rather than flush the
+    # cache each time, entries record the rebindable variables their chains
+    # pass through (see track_sources), so a rebinding invalidates just the
+    # entries that went through it. No capability is evaluated in between,
+    # so the flush beforehand leaves no settled capability or reader behind.
     def reflow_callee_returns!
+      flush_resolved
+      @tracking_chains = true
       @methods.each do |caller|
         caller.capabilities.each do |capability|
           callee = call_target(caller, capability)
@@ -3058,6 +4117,8 @@ module Autotype
           bind(result_var, resolve(callee.result))
         end
       end
+    ensure
+      @tracking_chains = false
     end
 
     def apply_forced_return_conventions!
@@ -3074,7 +4135,8 @@ module Autotype
     def force_return!(method, type)
       return unless method.result.is_a?(TypeVariable)
 
-      @substitutions[method.result] = type
+      link(method.result, type)
+      flush_resolved
       @changed = true
     end
 
@@ -3100,20 +4162,27 @@ module Autotype
     # messages callers send to its result are structural evidence. Attaching
     # them as capabilities lets the renderer show a named structural type
     # instead of Object. Display-only: no unification happens here.
+    # Nothing binds while narrowing, so every call target and dereferenced
+    # receiver stays what it was when first computed, across all rounds;
+    # only the capabilities attached since need computing.
     def narrow_residual_returns!
+      targets = {}.compare_by_identity
+      receivers = {}.compare_by_identity
       NARROWING_ROUNDS.times do
-        break unless narrowing_round
+        break unless narrowing_round(targets, receivers)
       end
     end
 
     # One narrowing round; returns true when new evidence was attached so a
     # follow-up round can propagate it through forwarding methods.
-    def narrowing_round
-      observations = Hash.new { |hash, key| hash[key] = [] }
+    def narrowing_round(targets, receivers)
+      # Keyed by identity: no two methods are equal (each has its own self
+      # variable), and hashing one walks its whole structure.
+      observations = {}.compare_by_identity
       @methods.each do |caller|
         caller.capabilities.each do |capability|
-          target = call_target(caller, capability)
-          observations[target] << [caller, capability.result] if target
+          target = targets.fetch(capability) { targets[capability] = call_target(caller, capability) }
+          (observations[target] ||= []) << [caller, capability.result] if target
         end
       end
 
@@ -3123,11 +4192,12 @@ module Autotype
         residual = residual_return_variables(callee) - parameter_variables
         next if residual.empty?
 
-        sends = collect_result_observations(calls)
+        sends = collect_result_observations(calls, receivers)
         next if sends.empty?
 
+        groups = receiver_groups(callee, receivers)
         residual.each do |variable|
-          existing = callee.capabilities.select { |capability| dereference(capability.receiver) == variable }
+          existing = groups[variable] ||= []
           seen = existing.map { |capability| [capability.message, capability.arguments.length] }.to_set
           budget = MAX_NARROWING_SENDS - seen.size
           break if budget <= 0
@@ -3136,7 +4206,7 @@ module Autotype
             key = [send.fetch(:message), send.fetch(:arguments).length]
             next if seen.include?(key)
 
-            callee.capabilities << Capability.new(
+            capability = Capability.new(
               receiver: variable,
               message: send.fetch(:message),
               arguments: send.fetch(:arguments),
@@ -3144,6 +4214,9 @@ module Autotype
               result: send.fetch(:result),
               line: callee.line
             )
+            callee.capabilities << capability
+            existing << capability
+            mark_rebindable(send.fetch(:result))
             seen << key
             changed = true
             break if seen.size >= MAX_NARROWING_SENDS
@@ -3151,6 +4224,15 @@ module Autotype
         end
       end
       changed
+    end
+
+    # A method's capabilities by dereferenced receiver, for the receivers
+    # that end at a variable, in order.
+    def receiver_groups(method, receivers)
+      receivers[method] ||= method.capabilities.each_with_object({}.compare_by_identity) do |capability, groups|
+        terminal = dereference(capability.receiver)
+        (groups[terminal] ||= []) << capability if terminal.is_a?(TypeVariable)
+      end
     end
 
     def residual_return_variables(method)
@@ -3162,15 +4244,13 @@ module Autotype
       end
     end
 
-    def collect_result_observations(calls)
+    def collect_result_observations(calls, receivers)
       groups = {}
       calls.each do |caller, result|
         terminal = dereference(result)
         next unless terminal.is_a?(TypeVariable)
 
-        caller.capabilities.each do |capability|
-          next unless dereference(capability.receiver) == terminal
-
+        receiver_groups(caller, receivers)[terminal]&.each do |capability|
           key = [capability.message, capability.arguments.length, capability.keywords.keys.sort]
           entry = groups[key] ||= {
             message: capability.message,
@@ -3193,7 +4273,43 @@ module Autotype
       Union.new(members.uniq)
     end
 
+    # types.reduce { |left, right| merge_union(left, right) } in one pass.
+    # Every merge keeps first occurrences, as uniq does, so it only appends
+    # the right side's unseen members; reducing tens of thousands of
+    # elements pairwise copies and rehashes the accumulated union per step.
+    def merge_unions(types)
+      merged = types.first
+      members = nil
+      seen = nil
+      types.each_with_index do |type, index|
+        next if index.zero?
+
+        if members
+          # The merged union equals type exactly when their members do.
+          next if type.instance_of?(Union) && members == type.members
+        else
+          next if merged == type
+
+          members = []
+          seen = {}
+          append_union_members(merged, members, seen)
+        end
+        append_union_members(type, members, seen)
+      end
+      members ? Union.new(members) : merged
+    end
+
+    def append_union_members(type, members, seen)
+      (type.is_a?(Union) ? type.members : [type]).each do |member|
+        next if seen.key?(member)
+
+        seen[member] = true
+        members << member
+      end
+    end
+
     def resolved_method(method)
+      parameters = method.parameters
       MethodResult.new(
         name: method.name,
         owner: method.owner,
@@ -3202,23 +4318,25 @@ module Autotype
         superclass: method.superclass,
         line: method.line,
         end_line: method.end_line,
-        parameters: method.parameters.map do |parameter|
+        parameters: parameters.empty? ? parameters : parameters.map do |parameter|
           Parameter.new(name: parameter.name, type: resolve(parameter.type), kind: parameter.kind)
         end,
         result: resolve(method.result),
         capabilities: method.capabilities.map do |capability|
+          arguments = capability.arguments
+          keywords = capability.keywords
           Capability.new(
             receiver: resolve(capability.receiver),
             message: capability.message,
-            arguments: capability.arguments.map { |argument| resolve(argument) },
-            keywords: capability.keywords.transform_values { |value| resolve(value) },
+            arguments: arguments.empty? ? arguments : arguments.map { |argument| resolve(argument) },
+            keywords: keywords.empty? ? keywords : keywords.transform_values { |value| resolve(value) },
             result: resolve(capability.result),
             line: capability.line
           )
         end,
         self_type: resolve(method.self_type),
-        ivars: method.ivars.transform_values { |type| resolve(type) },
-        locals: method.locals.transform_values { |type| resolve(type) },
+        ivars: method.ivars.empty? ? method.ivars : method.ivars.transform_values { |type| resolve(type) },
+        locals: method.locals.empty? ? method.locals : method.locals.transform_values { |type| resolve(type) },
         port_assignments: method.port_assignments,
         case_narrowings: method.case_narrowings
       )
@@ -3237,8 +4355,11 @@ module Autotype
     def class_name_from(type)
       return unless type.is_a?(Named)
 
-      match = type.name.match(/\AClass\[(.+)\]\z/)
-      match && match[1].delete_prefix("::")
+      name = type.name
+      @class_names.fetch(name) do
+        match = name.match(/\AClass\[(.+)\]\z/)
+        @class_names[name] = match && match[1].delete_prefix("::").freeze
+      end
     end
 
     def array_element(type)
@@ -3247,7 +4368,7 @@ module Autotype
         type.arguments.first if type.name == "Array"
       when Union
         elements = type.members.filter_map { |member| array_element(member) }
-        elements.reduce { |left, right| merge_union(left, right) }
+        merge_unions(elements)
       end
     end
 
@@ -3256,11 +4377,18 @@ module Autotype
       when Generic
         return type.arguments.first if %w[Array Enumerator Set].include?(type.name)
       when Union
-        elements = type.members.filter_map { |member| enumerable_element(member) }
-        return elements.reduce { |left, right| merge_union(left, right) } unless elements.empty?
+        return union_element(type) unless type.members.length >= Union::SAMPLED_HASH_MIN
+
+        # Purely structural, and wide receivers recur unchanged.
+        return @union_elements.fetch(type) { @union_elements[type] = union_element(type) }
       end
 
       nil
+    end
+
+    def union_element(union)
+      elements = union.members.filter_map { |member| enumerable_element(member) }
+      merge_unions(elements) unless elements.empty?
     end
   end
 
@@ -3346,6 +4474,9 @@ module Autotype
     # agree stay fixed, concrete slots that differ become unions, and slots
     # involving generics become shared parameters bound per occurrence.
     def consolidate!
+      # Occurrences by their current definition id; merging moves them.
+      occurrences_by_id = Hash.new { |hash, key| hash[key] = [] }
+      @occurrences.each_value { |occurrence| occurrences_by_id[occurrence.fetch(:definition).fetch(:id)] << occurrence }
       @definitions.values.group_by { |definition| definition.fetch(:template) }.each_value do |members|
         next if members.length == 1
 
@@ -3377,11 +4508,9 @@ module Autotype
           uses: members.sum { |member| member.fetch(:uses) }
         }
 
-        member_ids = members.to_set { |member| member.fetch(:id) }
-        @occurrences.each_value do |occurrence|
+        moved = members.map { |member| member.fetch(:id) }.uniq.flat_map { |id| occurrences_by_id.delete(id) || [] }
+        moved.each do |occurrence|
           definition = occurrence.fetch(:definition)
-          next unless member_ids.include?(definition.fetch(:id))
-
           occurrence[:arguments] = parameter_slots.map do |index|
             TemplateArgument.new(
               template: definition.fetch(:slots)[index],
@@ -3390,65 +4519,107 @@ module Autotype
           end
           occurrence[:definition] = merged
         end
+        occurrences_by_id[merged_id].concat(moved)
         members.each { |member| @definitions.delete(member.fetch(:id)) }
         @definitions[merged_id] = merged
       end
     end
 
+    # The template marks each slot with a %index% placeholder, and the
+    # definition is the template with the placeholders spelled out; both are
+    # written in one walk. A name containing a percent sign could read as a
+    # placeholder, so then the definition is substituted into the template.
+    Shape = Struct.new(:receiver, :parameter_types, :parameter_indexes, :slots, :template, :definition, :percent)
+
     def build_shape(receiver, capabilities)
-      parameter_types = []
-      parameter_indexes = {}
-      slots = []
-      normalize = lambda do |type|
-        case type
-        when TypeVariable
-          return "Self" if type == receiver
-
-          index = parameter_indexes[type] ||= begin
-            parameter_types << type
-            parameter_types.length
+      shape = Shape.new(receiver, [], {}, [], +"{ ", +"{ ", false)
+      sorted = capabilities.length == 1 ? capabilities : capabilities.sort_by { |capability| capability_sort_key(capability) }
+      sorted.each_with_index do |capability, position|
+        append_shape(shape, "; ") if position.positive?
+        append_shape_name(shape, capability.message.to_s)
+        append_shape(shape, "(")
+        capability.arguments.each_with_index do |argument, index|
+          append_shape(shape, ", ") if index.positive?
+          slotify(shape, argument)
+        end
+        unless capability.keywords.empty?
+          separate = !capability.arguments.empty?
+          capability.keywords.sort.each do |name, value|
+            append_shape(shape, ", ") if separate
+            separate = true
+            append_shape_name(shape, name.to_s)
+            append_shape(shape, ": ")
+            slotify(shape, value)
           end
-          "T#{index}"
-        when Named
-          type.name
-        when Generic
-          "#{type.name}[#{type.arguments.map { |argument| normalize.call(argument) }.join(", ")}]"
-        when Union
-          format_union_slots(type.members.map { |member| normalize.call(member) }.uniq)
-        when Function
-          params = type.parameters.map { |parameter| normalize.call(parameter) }.join(", ")
-          "(#{params}) -> #{normalize.call(type.result)}"
-        else
-          "Object"
         end
+        append_shape(shape, ") -> ")
+        slotify(shape, capability.result)
       end
-      # Functions are structure (block arity), everything else is a type slot.
-      slotify = lambda do |type|
-        if type.is_a?(Function)
-          params = type.parameters.map { |parameter| slotify.call(parameter) }.join(", ")
-          "(#{params}) -> #{slotify.call(type.result)}"
-        else
-          slots << normalize.call(type)
-          "%#{slots.length - 1}%"
-        end
-      end
-
-      sends = capabilities.sort_by { |capability| capability_sort_key(capability) }.map do |capability|
-        arguments = capability.arguments.map { |argument| slotify.call(argument) }
-        arguments.concat(
-          capability.keywords.sort.map { |name, value| "#{name}: #{slotify.call(value)}" }
-        )
-        "#{capability.message}(#{arguments.join(", ")}) -> #{slotify.call(capability.result)}"
-      end
-      template = "{ #{sends.join("; ")} }"
+      append_shape(shape, " }")
+      parameter_types = shape.parameter_types
+      slots = shape.slots
+      template = shape.template
 
       {
         parameter_types: parameter_types,
         parameter_names: parameter_types.each_index.map { |index| "T#{index + 1}" },
         template: template,
         slots: slots,
-        definition: template.gsub(/%(\d+)%/) { slots[Regexp.last_match(1).to_i] }
+        definition: shape.percent ? template.gsub(/%(\d+)%/) { slots[Regexp.last_match(1).to_i] } : shape.definition
       }
+    end
+
+    def append_shape(shape, text)
+      shape.template << text
+      shape.definition << text
+    end
+
+    def append_shape_name(shape, name)
+      shape.percent = true if name.include?("%")
+      append_shape(shape, name)
+    end
+
+    # Functions are structure (block arity), everything else is a type slot.
+    def slotify(shape, type)
+      if type.is_a?(Function)
+        append_shape(shape, "(")
+        type.parameters.each_with_index do |parameter, index|
+          append_shape(shape, ", ") if index.positive?
+          slotify(shape, parameter)
+        end
+        append_shape(shape, ") -> ")
+        slotify(shape, type.result)
+      else
+        slot = normalize_slot(shape, type)
+        slots = shape.slots
+        shape.template << "%" << slots.length.to_s << "%"
+        shape.definition << slot
+        slots << slot
+      end
+    end
+
+    def normalize_slot(shape, type)
+      case type
+      when TypeVariable
+        return "Self" if type == shape.receiver
+
+        index = shape.parameter_indexes[type] ||= begin
+          shape.parameter_types << type
+          shape.parameter_types.length
+        end
+        "T#{index}"
+      when Named
+        type.name
+      when Generic
+        "#{type.name}[#{type.arguments.map { |argument| normalize_slot(shape, argument) }.join(", ")}]"
+      when Union
+        format_union_slots(type.members.map { |member| normalize_slot(shape, member) }.uniq)
+      when Function
+        params = type.parameters.map { |parameter| normalize_slot(shape, parameter) }.join(", ")
+        "(#{params}) -> #{normalize_slot(shape, type.result)}"
+      else
+        "Object"
+      end
     end
 
     def capability_sort_key(capability)
@@ -3492,10 +4663,36 @@ module Autotype
 
     attr_reader :helper_registry
 
-    def initialize(method, helper_registry: UniversalHelperRegistry.new([method]), analyzed_method: method)
+    # Type simplification and string polishing are pure and repeat heavily
+    # across methods, so renderers of one analysis share these memos.
+    def self.memo
+      {
+        polished: {}, simplified: {}.compare_by_identity, simplified_trees: {}, joined: {},
+        argument_texts: {}.compare_by_identity, solved_texts: {}.compare_by_identity,
+        result_variables: {}.compare_by_identity,
+        subtree_results: {}.compare_by_identity, subtree_reaches: {}.compare_by_identity
+      }
+    end
+
+    def initialize(method, helper_registry: UniversalHelperRegistry.new([method]), analyzed_method: method, memo: Renderer.memo)
       @method = method
       @analyzed_method = analyzed_method
       @helper_registry = helper_registry
+      @polished = memo.fetch(:polished)
+      @simplified = memo.fetch(:simplified)
+      @simplified_trees = memo.fetch(:simplified_trees)
+      @subtree_results = memo[:subtree_results] ||= {}.compare_by_identity
+      @subtree_reaches = memo[:subtree_reaches] ||= {}.compare_by_identity
+      @tree_reach = nil
+      @argument_texts = memo.fetch(:argument_texts)
+      @solved_texts = memo.fetch(:solved_texts)
+      @joined = memo.fetch(:joined) { {} }
+      @result_variables = memo[:result_variables] ||= {}.compare_by_identity
+      register_result_variables
+      @structural_texts = {}.compare_by_identity
+      @consulted_variable = false
+      @references = {}.compare_by_identity
+      @rendering = Set.new
       @names = {}
       @helpers = analyzed_method.capabilities
         .map(&:receiver)
@@ -3508,16 +4705,14 @@ module Autotype
     end
 
     def text
-      params = @method.parameters.map { |parameter| render_parameter(parameter) }.join(", ")
-      signature = "#{@method.name} : (#{params}) -> #{render(@method.result, grounded_only: true)}"
       helpers = helper_definitions.map do |helper|
         parameters = helper.fetch(:parameters)
         generic = parameters.empty? ? "" : "<#{parameters.join(", ")}>"
         definition = polish_type_string(helper.fetch(:definition))
         "  type #{helper.fetch(:name)}#{generic} = #{definition}"
       end
-      constraints = ungrouped_capabilities.map do |capability|
-        "  L#{capability.line}: #{render_capability(capability)}"
+      constraints = ungrouped_capabilities.zip(rendered_constraints).map do |capability, rendered|
+        "  L#{capability.line}: #{rendered}"
       end
       sections = [signature]
       sections << "helpers:\n#{helpers.join("\n")}" unless helpers.empty?
@@ -3530,15 +4725,27 @@ module Autotype
         name: @method.name,
         line: @method.line,
         end_line: @method.end_line,
-        signature: text.lines.first.chomp,
+        signature: signature.lines.first.chomp,
         helpers: helper_definitions,
-        constraints: ungrouped_capabilities.map { |capability| render_capability(capability) },
+        constraints: rendered_constraints,
         send_constraint_count: @method.capabilities.length,
         locals: rendered_bindings
       }
     end
 
     private
+
+    # Rendering is pure, so the pieces shared by text and as_json render once.
+    def signature
+      @signature ||= begin
+        params = @method.parameters.map { |parameter| render_parameter(parameter) }.join(", ")
+        "#{@method.name} : (#{params}) -> #{render(@method.result, grounded_only: true)}"
+      end
+    end
+
+    def rendered_constraints
+      @rendered_constraints ||= ungrouped_capabilities.map { |capability| render_capability(capability) }
+    end
 
     # Local variables, parameters, and ivars with their rendered types, for
     # editor hover support.
@@ -3609,14 +4816,47 @@ module Autotype
     end
 
     def solved_capabilities_for(analyzed_variable)
-      analyzed = @analyzed_method.capabilities.select { |capability| capability.receiver == analyzed_variable }
-      analyzed.map do |analyzed_capability|
-        @method.capabilities.find do |solved_capability|
-          solved_capability.line == analyzed_capability.line &&
-            solved_capability.message == analyzed_capability.message &&
-            index_key_eq?(solved_capability.arguments, analyzed_capability.arguments)
+      analyzed_by_receiver.fetch(analyzed_variable, EMPTY).map do |analyzed_capability|
+        solved_at(analyzed_capability).find do |solved_capability|
+          index_key_eq?(solved_capability.arguments, analyzed_capability.arguments)
         end || analyzed_capability
       end
+    end
+
+    EMPTY = [].freeze
+
+    # Capability lookups by identity-hashed variables or by source position,
+    # in list order, so each finds what a scan of the list would.
+    def solved_by_receiver = @solved_by_receiver ||= @method.capabilities.group_by(&:receiver)
+    def analyzed_by_receiver = @analyzed_by_receiver ||= @analyzed_method.capabilities.group_by(&:receiver)
+
+    def solved_at(capability)
+      @solved_by_position ||= @method.capabilities.group_by { |solved| [solved.line, solved.message] }
+      @solved_by_position.fetch([capability.line, capability.message], EMPTY)
+    end
+
+    def analyzed_by_result
+      @analyzed_by_result ||= @analyzed_method.capabilities.each_with_object({}) do |capability, index|
+        index[capability.result] = capability unless index.key?(capability.result)
+      end
+    end
+
+    # A variable that is no renderer's capability result renders as Object in
+    # every renderer, so texts reaching only such variables are shared. Texts
+    # shared before a renderer adds new result variables may not hold for it.
+    def register_result_variables
+      added = false
+      @analyzed_method.capabilities.each do |capability|
+        result = capability.result
+        next if !result.is_a?(TypeVariable) || @result_variables.key?(result)
+
+        @result_variables[result] = true
+        added = true
+      end
+      return unless added
+
+      @argument_texts.clear
+      @solved_texts.clear
     end
 
     def index_key_eq?(left_args, right_args)
@@ -3641,10 +4881,8 @@ module Autotype
     end
 
     def record_parameter?(variable)
-      @analyzed_method.capabilities.any? do |capability|
-        capability.receiver == variable &&
-          capability.message == :[] &&
-          field_name_from_index_key(capability.arguments.first)
+      analyzed_by_receiver.fetch(variable, EMPTY).any? do |capability|
+        capability.message == :[] && field_name_from_index_key(capability.arguments.first)
       end
     end
 
@@ -3687,23 +4925,127 @@ module Autotype
       polish_type_string(rendered)
     end
 
+    # Variables and named types come back as they are, wherever they sit.
     def simplify(type, seen = nil, depth = 0)
-      return type if depth > 48
-      seen ||= Set.new
-      return type if seen.include?(type.object_id)
+      return type unless type.is_a?(Union) || type.is_a?(Generic) || type.is_a?(Function)
+      if seen
+        return @tree_reach ? simplify_subtree(type, seen, depth) : simplify_uncached(type, seen, depth)
+      end
 
-      seen.add(type.object_id)
+      @simplified.fetch(type) do
+        @simplified[type] =
+          if (result = @subtree_results[type])
+            result
+          elsif tree_shaped?(type)
+            @simplified_trees.fetch(type) { @simplified_trees[type] = simplify_tree(type) }
+          else
+            simplify_uncached(type, nil, 0)
+          end
+      end
+    end
+
+    MAX_SIMPLIFY_DEPTH = 48
+
+    # Walking a tree meets no node twice, and the results it simplifies
+    # again are built fresh during the walk, so the seen set never answers
+    # and is skipped. A subtree then simplifies the same wherever it sits
+    # unless the depth cutoff truncates it: each result records how far
+    # below its node the work went, and is reused wherever that stays
+    # within the cutoff, so trees sharing subtrees share their results.
+    #
+    # Every node in a result comes from the subtree of one input node, and
+    # sibling subtrees of a tree are disjoint, so results are trees too and
+    # every key here is one. A node that simplifies to an equal term stands
+    # for its own result, which lets rendering, as it simplifies each part
+    # of a result again, find those parts already done.
+    def simplify_tree(type)
+      @tree_reach = 0
+      simplify_subtree(type, true, 0)
+    ensure
+      @tree_reach = nil
+    end
+
+    def simplify_subtree(type, seen, depth)
+      if (result = @subtree_results[type])
+        reach = depth + @subtree_reaches[type]
+        if reach <= MAX_SIMPLIFY_DEPTH
+          @tree_reach = reach if reach > @tree_reach
+          return result
+        end
+      end
+
+      outer = @tree_reach
+      @tree_reach = depth
+      result = simplify_uncached(type, seen, depth)
+      result = type if result.eql?(type)
+      reach = @tree_reach
+      if reach <= MAX_SIMPLIFY_DEPTH
+        @subtree_results[type] = result
+        @subtree_reaches[type] = reach - depth
+      end
+      @tree_reach = outer if outer > reach
+      result
+    end
+
+    # Simplifying returns a node it has already visited untouched, so its
+    # result follows the type's structure alone only when no composite node
+    # occurs twice; such types share results across structurally equal
+    # copies.
+    def tree_shaped?(type)
+      visited = {}.compare_by_identity
+      stack = [type]
+      until stack.empty?
+        node = stack.pop
+        case node
+        when Union
+          return false if visited.key?(node)
+
+          visited[node] = true
+          stack.concat(node.members)
+        when Generic
+          return false if visited.key?(node)
+
+          visited[node] = true
+          stack.concat(node.arguments)
+        when Function
+          return false if visited.key?(node)
+
+          visited[node] = true
+          stack.concat(node.parameters) << node.result
+        end
+      end
+      true
+    end
+
+    def simplify_uncached(type, seen, depth)
+      if @tree_reach
+        @tree_reach = depth if depth > @tree_reach
+        return type if depth > MAX_SIMPLIFY_DEPTH
+      else
+        return type if depth > MAX_SIMPLIFY_DEPTH
+
+        seen ||= {}.compare_by_identity
+        return type if seen.key?(type)
+
+        seen[type] = true
+      end
       case type
       when Union
-        members = type.members.flat_map { |member| member.is_a?(Union) ? member.members : [member] }
-        members = members.map { |member| simplify(member, seen, depth + 1) }
+        members = []
+        type.members.each do |member|
+          if member.is_a?(Union)
+            member.members.each { |inner| members << simplify(inner, seen, depth + 1) }
+          else
+            members << simplify(member, seen, depth + 1)
+          end
+        end
         members = dedupe_types(members)
         return members.first if members.length == 1
 
-        nil_members, rest = members.partition { |member| nil_type?(member) }
-        if nil_members.any?
-          inner = rest.length == 1 ? rest.first : Union.new(rest)
-          inner = simplify(inner, seen, depth + 1)
+        if members.any? { |member| nil_type?(member) }
+          rest = members.reject { |member| nil_type?(member) }
+          # A union built here is new, so no result can be stored for it.
+          inner = rest.length == 1 ? simplify(rest.first, seen, depth + 1) : simplify_uncached(Union.new(rest), seen, depth + 1)
           return Generic.new(NULLABLE, [inner]) unless nil_type?(inner)
 
           return inner
@@ -3759,6 +5101,10 @@ module Autotype
     # Nullable[T] when nil is present; otherwise a sorted, deduped union. Never
     # drop members — an incomplete inference is shown as Object, not elided.
     def join_union(rendered)
+      @joined.fetch(rendered) { @joined[rendered.frozen? ? rendered : rendered.dup.freeze] = join_union_uncached(rendered).freeze }
+    end
+
+    def join_union_uncached(rendered)
       parts = []
       has_nil = false
       rendered.uniq.each do |member|
@@ -3789,18 +5135,30 @@ module Autotype
 
     # Rewrite nil-union slots inside helper definition text and similar
     # pre-rendered type strings from the registry.
+    # Every rewrite below needs "nil" or "Nullable[" in the text.
     def polish_type_string(text)
       return text unless text.is_a?(String)
+      return text unless text.include?("nil") || text.include?("Nullable[")
 
+      @polished[text] ||= polish_uncached(text).freeze
+    end
+
+    # The patterns need these literals, and scanning for a literal is far
+    # cheaper than a regex backtracking through every position of a long text.
+    def polish_uncached(text)
       text = flatten_nullable_text(text)
       8.times do
         previous = text
-        text = text.gsub(/([A-Za-z0-9_:|\[\], ]+ \|\ nil|nil \|\ [A-Za-z0-9_:|\[\], ]+)/) do |match|
-          join_union(split_top_level_union(match))
+        if text.include?(" | nil") || text.include?("nil | ")
+          text = text.gsub(/([A-Za-z0-9_:|\[\], ]+ \|\ nil|nil \|\ [A-Za-z0-9_:|\[\], ]+)/) do |match|
+            join_union(split_top_level_union(match))
+          end
         end
-        text = text.gsub(/Nullable\[([^\]]+)\]/) do |_match|
-          inner = join_union(split_top_level_union(Regexp.last_match(1)))
-          inner.start_with?("Nullable[") ? inner : "Nullable[#{inner}]"
+        if text.include?("Nullable[")
+          text = text.gsub(/Nullable\[([^\]]+)\]/) do |_match|
+            inner = join_union(split_top_level_union(Regexp.last_match(1)))
+            inner.start_with?("Nullable[") ? inner : "Nullable[#{inner}]"
+          end
         end
         text = flatten_nullable_text(text)
         break if text == previous
@@ -3817,31 +5175,48 @@ module Autotype
       text
     end
 
+    OPEN_BRACKET = "[".ord
+    CLOSE_BRACKET = "]".ord
+    SPACE = " ".ord
+    PIPE = "|".ord
+
+    # Scans bytes so no per-character strings are allocated; the separators
+    # are ASCII, which never occurs inside a multibyte UTF-8 sequence.
     def split_top_level_union(text)
       parts = []
       depth = 0
       start = 0
-      i = 0
-      while i < text.length
-        char = text[i]
-        depth += 1 if char == "["
-        depth -= 1 if char == "]"
-        if depth.zero? && text[i, 3] == " | "
-          parts << text[start...i].strip
-          i += 3
-          start = i
+      index = 0
+      length = text.bytesize
+      while index < length
+        byte = text.getbyte(index)
+        if byte == OPEN_BRACKET
+          depth += 1
+        elsif byte == CLOSE_BRACKET
+          depth -= 1
+        elsif depth.zero? && byte == SPACE && text.getbyte(index + 1) == PIPE && text.getbyte(index + 2) == SPACE
+          parts << text.byteslice(start, index - start).strip
+          index += 3
+          start = index
           next
         end
-        i += 1
+        index += 1
       end
-      parts << text[start..].strip
+      parts << text.byteslice(start, length - start).strip
       parts.reject(&:empty?)
     end
 
+    # Only reached from render, never while a helper argument is being
+    # rendered, so the text depends on the variable and depth alone.
     def render_structural_variable(variable, depth: 0)
-      return "Object" if depth > 16
+      return "Object" if depth > 16 || !solved_by_receiver.key?(variable)
 
-      capabilities = @method.capabilities.select { |capability| capability.receiver == variable }
+      memo = @structural_texts[variable] ||= {}
+      memo.fetch(depth) { memo[depth] = render_structural_variable_uncached(variable, depth).freeze }
+    end
+
+    def render_structural_variable_uncached(variable, depth)
+      capabilities = solved_by_receiver.fetch(variable, EMPTY)
       return "Object" if capabilities.empty?
 
       body = capabilities.first(24).map { |capability| render_send(capability, depth: depth + 1) }.uniq.join("; ")
@@ -3861,7 +5236,7 @@ module Autotype
     end
 
     def helper_definitions
-      @helpers.values.uniq.map do |occurrence|
+      @helper_definitions ||= @helpers.values.uniq.map do |occurrence|
         definition = occurrence.fetch(:definition)
         {
           name: definition.fetch(:name),
@@ -3873,22 +5248,42 @@ module Autotype
     end
 
     def ungrouped_capabilities
-      grouped_lines = @analyzed_method.capabilities
-        .select { |capability| capability.receiver.is_a?(TypeVariable) && @helpers.key?(capability.receiver) }
-        .map(&:line)
-        .to_set
-      @method.capabilities.reject { |capability| grouped_lines.include?(capability.line) }
+      @ungrouped_capabilities ||= begin
+        grouped_lines = @analyzed_method.capabilities
+          .select { |capability| capability.receiver.is_a?(TypeVariable) && @helpers.key?(capability.receiver) }
+          .map(&:line)
+          .to_set
+        @method.capabilities.reject { |capability| grouped_lines.include?(capability.line) }
+      end
     end
 
+    # Never reached while a variable is being rendered, so the text depends
+    # only on the occurrence.
     def render_helper_reference(occurrence)
-      arguments = occurrence.fetch(:arguments).map { |argument| render_helper_argument(argument) }
-      name = occurrence.fetch(:definition).fetch(:name)
-      reference = arguments.empty? ? name : "#{name}[#{arguments.join(", ")}]"
-      polish_type_string(reference)
+      @references[occurrence] ||= begin
+        arguments = occurrence.fetch(:arguments).map { |argument| render_helper_argument(argument) }
+        name = occurrence.fetch(:definition).fetch(:name)
+        reference = arguments.empty? ? name : "#{name}[#{arguments.join(", ")}]"
+        polish_type_string(reference)
+      end
     end
 
+    # Text for a type reached without consulting a variable is the same in
+    # every renderer, so renderers share it.
     def render_helper_argument(type)
       type = simplify(type) if type.is_a?(Union) || type.is_a?(Generic)
+      cached = @argument_texts[type]
+      return cached if cached
+
+      outer = @consulted_variable
+      @consulted_variable = false
+      text = render_helper_argument_uncached(type)
+      @argument_texts[type] = text unless @consulted_variable
+      @consulted_variable ||= outer
+      text
+    end
+
+    def render_helper_argument_uncached(type)
       case type
       when TemplateArgument
         substituted = type.template.gsub(/\bT(\d+)\b/) do
@@ -3896,22 +5291,18 @@ module Autotype
         end
         polish_type_string(substituted)
       when TypeVariable
-        solved = solved_type_for_variable(type)
-        case solved
-        when Named then solved.name
-        when Generic
-          if solved.name == NULLABLE && solved.arguments.length == 1
-            return "Nullable[#{render_helper_argument(solved.arguments.first)}]"
-          end
+        return "Object" unless @result_variables.key?(type)
 
-          "#{solved.name}[#{solved.arguments.map { |argument| render_helper_argument(argument) }.join(", ")}]"
-        when Union
-          join_union(solved.members.map { |member| render_helper_argument(member) })
-        when Function
-          parameters = solved.parameters.map { |parameter| render_helper_argument(parameter) }.join(", ")
-          "(#{parameters}) -> #{render_helper_argument(solved.result)}"
-        else
-          "Object"
+        @consulted_variable = true
+        # solved_type_for_variable matches sends by line and message, so a
+        # variable can map to a sibling send whose type contains it again.
+        return "Object" if @rendering.include?(type)
+
+        @rendering << type
+        begin
+          render_solved(solved_type_for_variable(type))
+        ensure
+          @rendering.delete(type)
         end
       when Named
         type.name
@@ -3927,13 +5318,43 @@ module Autotype
       end
     end
 
+    # A solved type renders unsimplified at the top, unlike an argument.
+    def render_solved(solved)
+      cached = @solved_texts[solved]
+      return cached if cached
+
+      outer = @consulted_variable
+      @consulted_variable = false
+      text = render_solved_uncached(solved)
+      @solved_texts[solved] = text unless @consulted_variable
+      @consulted_variable ||= outer
+      text
+    end
+
+    def render_solved_uncached(solved)
+      case solved
+      when Named then solved.name
+      when Generic
+        if solved.name == NULLABLE && solved.arguments.length == 1
+          return "Nullable[#{render_helper_argument(solved.arguments.first)}]"
+        end
+
+        "#{solved.name}[#{solved.arguments.map { |argument| render_helper_argument(argument) }.join(", ")}]"
+      when Union
+        join_union(solved.members.map { |member| render_helper_argument(member) })
+      when Function
+        parameters = solved.parameters.map { |parameter| render_helper_argument(parameter) }.join(", ")
+        "(#{parameters}) -> #{render_helper_argument(solved.result)}"
+      else
+        "Object"
+      end
+    end
+
     def solved_type_for_variable(analyzed_variable)
-      analyzed_capability = @analyzed_method.capabilities.find { |capability| capability.result == analyzed_variable }
+      analyzed_capability = analyzed_by_result[analyzed_variable]
       return nil unless analyzed_capability
 
-      @method.capabilities.find do |capability|
-        capability.line == analyzed_capability.line && capability.message == analyzed_capability.message
-      end&.result
+      solved_at(analyzed_capability).first&.result
     end
   end
 
@@ -4264,14 +5685,25 @@ module Autotype
     end
 
     def name!
+      # Every round renames each definition at its current level, which only
+      # rises; a definition's name at a level never changes within a run.
+      @names = {}.compare_by_identity
+      @parsed_sends = {}
       levels = Hash.new(1)
       names = {}
+      # Nothing is renamed until the rounds end, so the definitions keep
+      # their order, and a name normalizes the same in every round.
+      definitions = @registry.definitions
+      normalized = {}
       (MAX_LEVEL * 4).times do
-        names = @registry.definitions.to_h do |definition|
+        names = definitions.to_h do |definition|
           [definition.fetch(:id), name_for(definition, levels[definition.fetch(:id)])]
         end
-        clusters = @registry.definitions
-          .group_by { |definition| @registry.normalize_semantic_name(names[definition.fetch(:id)]) }
+        clusters = definitions
+          .group_by do |definition|
+            name = names[definition.fetch(:id)]
+            normalized.fetch(name) { normalized[name] = @registry.normalize_semantic_name(name) }
+          end
           .select { |_, members| members.length > 1 }
         break if clusters.empty?
 
@@ -4322,6 +5754,11 @@ module Autotype
     end
 
     def name_for(definition, level)
+      memo = (@names ||= {}.compare_by_identity)[definition] ||= {}
+      memo.fetch(level) { memo[level] = name_for_uncached(definition, level) }
+    end
+
+    def name_for_uncached(definition, level)
       sends = parse_sends(definition.fetch(:definition))
       slots = definition.fetch(:slots)
       case level
@@ -4429,21 +5866,44 @@ module Autotype
     end
 
     def parse_sends(definition)
-      body = definition.delete_prefix("{ ").delete_suffix(" }")
-      body.split("; ").map { |send| parse_send(send) }
+      (@parsed_sends ||= {}).fetch(definition) do
+        body = definition.delete_prefix("{ ").delete_suffix(" }")
+        @parsed_sends[definition] = body.split("; ").map { |send| parse_send(send) }
+      end
     end
+
+    OPEN_PAREN = "(".ord
+    CLOSE_PAREN = ")".ord
+    OPEN_SQUARE = "[".ord
+    CLOSE_SQUARE = "]".ord
+    COMMA = ",".ord
 
     def parse_send(send)
       open = send.index("(")
       message = send[0...open]
       depth = 0
       close = open
-      (open...send.length).each do |index|
-        depth += 1 if send[index] == "("
-        depth -= 1 if send[index] == ")"
-        if depth.zero?
-          close = index
-          break
+      if open && send.ascii_only?
+        index = open
+        length = send.bytesize
+        while index < length
+          byte = send.getbyte(index)
+          depth += 1 if byte == OPEN_PAREN
+          depth -= 1 if byte == CLOSE_PAREN
+          if depth.zero?
+            close = index
+            break
+          end
+          index += 1
+        end
+      else
+        (open...send.length).each do |index|
+          depth += 1 if send[index] == "("
+          depth -= 1 if send[index] == ")"
+          if depth.zero?
+            close = index
+            break
+          end
         end
       end
       {
@@ -4455,6 +5915,7 @@ module Autotype
 
     def split_top_level(text)
       return [] if text.empty?
+      return split_top_level_ascii(text) if text.ascii_only?
 
       parts = []
       depth = 0
@@ -4470,6 +5931,31 @@ module Autotype
         end
       end
       parts << current.strip unless current.strip.empty?
+      parts
+    end
+
+    # split_top_level over bytes: a comma that would start an empty part
+    # stays in the part, as it does above.
+    def split_top_level_ascii(text)
+      parts = []
+      depth = 0
+      start = 0
+      index = 0
+      length = text.bytesize
+      while index < length
+        byte = text.getbyte(index)
+        if byte == OPEN_PAREN || byte == OPEN_SQUARE
+          depth += 1
+        elsif byte == CLOSE_PAREN || byte == CLOSE_SQUARE
+          depth -= 1
+        elsif byte == COMMA && depth.zero? && index > start
+          parts << text.byteslice(start, index - start).strip
+          start = index + 1
+        end
+        index += 1
+      end
+      last = text.byteslice(start, length - start).strip
+      parts << last unless last.empty?
       parts
     end
   end
