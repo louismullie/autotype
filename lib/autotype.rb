@@ -5,6 +5,7 @@ require_relative "autotype/type_string"
 require_relative "autotype/profile"
 require_relative "autotype/discovery_profile"
 require_relative "autotype/engine"
+require_relative "autotype/analysis"
 
 module Autotype
   class << self

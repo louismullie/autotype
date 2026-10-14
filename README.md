@@ -11,7 +11,7 @@ gem install autotype
 Or from source:
 
 ```bash
-bundle exec rake native:compile
+bundle install
 bundle exec rspec
 ```
 
@@ -20,12 +20,6 @@ bundle exec rspec
 ```bash
 autotype app/**/*.rb --json
 autotype lib/**/*.rb --html typedoc.html
-```
-
-Enable the native C solver priming pass:
-
-```bash
-AUTOTYPE_NATIVE=1 autotype app/**/*.rb --json
 ```
 
 No config file is required. Autotype discovers actor port wiring, emit patterns, entity factories, and type file locations from your Ruby source.
@@ -67,14 +61,6 @@ Everything in the old verbose config (`dsl`, `wiring`, `pipeline`, `structured`,
 require "autotype"
 
 Autotype.run(["app/models/user.rb", "--json"])
-```
-
-## Native extension
-
-The optional C extension accelerates the builtin fixed-point solver. It compiles automatically on gem install via `ext/autotype/extconf.rb`, sharing sources with `native/autotype/`.
-
-```bash
-cd native/autotype && make test
 ```
 
 ## Editor extension

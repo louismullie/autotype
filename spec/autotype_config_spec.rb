@@ -59,6 +59,33 @@ RSpec.describe Autotype::DiscoveryProfile do
     )
   end
 
+  it "lists the project tree once however many types it locates" do
+    profile = described_class.new(root: fixture_root)
+    allow(profile).to receive(:git_ruby_files).and_call_original
+    allow(Dir).to receive(:glob).and_call_original
+
+    expect(profile.locate_type_file("App::Entities::ToolCall")).to end_with("entities/tool_call.rb")
+    expect(profile.locate_type_file("App::Entities::ToolResult")).to end_with("entities/tool_result.rb")
+    expect(profile.locate_type_file("App::Entities::Missing")).to be_nil
+    expect(profile).to have_received(:git_ruby_files).once
+    expect(Dir).to have_received(:glob).at_most(:once)
+  end
+
+  it "skips files git ignores when locating types" do
+    Dir.mktmpdir do |dir|
+      system("git", "init", "-q", dir, exception: true)
+      File.write(File.join(dir, ".gitignore"), "vendor/\n")
+      { "vendor/gems/tool_call.rb" => "class ToolCall; end\n", "app/entities/tool_result.rb" => "class ToolResult; end\n" }.each do |path, source|
+        FileUtils.mkdir_p(File.dirname(File.join(dir, path)))
+        File.write(File.join(dir, path), source)
+      end
+
+      profile = described_class.new(root: dir)
+      expect(profile.locate_type_file("ToolResult")).to eq(File.join(dir, "app/entities/tool_result.rb"))
+      expect(profile.locate_type_file("ToolCall")).to be_nil
+    end
+  end
+
   it "loads optional overrides from autotype.yml" do
     Dir.mktmpdir do |dir|
       config_path = File.join(dir, "autotype.yml")
