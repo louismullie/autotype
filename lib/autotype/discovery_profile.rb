@@ -163,16 +163,19 @@ module Autotype
       return cache_type_path(type_name, explicit) if explicit
 
       basename = type_name.split("::").last
-      snake = underscore(basename)
-      candidates = @search_roots.flat_map do |search_root|
-        Dir.glob(File.join(search_root, "**", "#{snake}.rb"))
-      end.uniq
+      file_name = "#{underscore(basename)}.rb"
+      candidates = @search_roots.flat_map { |search_root| ruby_files_under(search_root).fetch(file_name, []) }.uniq
 
       path = candidates.find { defines_type?(_1, type_name, basename) }
       cache_type_path(type_name, path)
     end
 
     private
+
+    # Walked once per root: a glob per type name rewalks the whole tree (vendor/ included) on every lookup.
+    def ruby_files_under(search_root)
+      @ruby_files_by_root[search_root] ||= Dir.glob(File.join(search_root, "**", "*.rb")).group_by { File.basename(_1) }
+    end
 
     def reset_inference!
       @finalized = false
@@ -183,6 +186,7 @@ module Autotype
       @structured_type_prefixes = Array(@overrides.dig("structured", "prefixes"))
       @framework_self_fallbacks = explicit_self_fallbacks
       @type_path_cache = {}
+      @ruby_files_by_root = {}
     end
 
     def cache_type_path(type_name, path)

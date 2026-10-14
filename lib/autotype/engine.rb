@@ -35,6 +35,9 @@ module Autotype
     :parameters, :result, :capabilities, :self_type, :ivars, :locals, :port_assignments,
     :case_narrowings
   )
+  # A file or method autotype could not analyze. `kind` is :parse or
+  # :analysis; `name` is the qualified method name, or nil for the file.
+  Diagnostic = Data.define(:kind, :path, :line, :name, :message)
 
   class InferenceMetadata
     PortWiring = Data.define(:handler_method, :dispatch_param, :dispatch_param_type, :entity_param)
@@ -259,7 +262,13 @@ module Autotype
 
       parameters = []
       required = parameters_node.requireds + parameters_node.posts
-      required.each { |node| parameters << bind_parameter(node.name, :required) }
+      required.each do |node|
+        parameters << if node.is_a?(Prism::MultiTargetNode)
+          Parameter.new(name: node.slice.to_sym, type: bind_block_parameter(node), kind: :required)
+        else
+          bind_parameter(node.name, :required)
+        end
+      end
       parameters_node.optionals.each do |node|
         parameters << bind_parameter(node.name, :optional, default_node: node.value)
       end
@@ -347,6 +356,8 @@ module Autotype
         infer_statements(node)
       when Prism::LocalVariableReadNode
         @environment[node.name] ||= @local_bindings[node.name] ||= fresh(node.name)
+      when Prism::ItLocalVariableReadNode
+        @environment[:it] ||= fresh(:it)
       when Prism::LocalVariableWriteNode
         value = infer(node.value)
         @environment[node.name] = value
@@ -450,9 +461,13 @@ module Autotype
       node.arguments&.arguments&.each do |argument|
         if argument.is_a?(Prism::KeywordHashNode)
           argument.elements.each do |element|
-            if element.is_a?(Prism::AssocNode)
-              key = element.key.respond_to?(:value) ? element.key.value : element.key.slice
-              keywords[key.to_sym] = infer_keyword_argument(element.value)
+            if element.is_a?(Prism::AssocNode) && element.key.is_a?(Prism::SymbolNode)
+              keywords[element.key.unescaped.to_sym] = infer_keyword_argument(element.value)
+            elsif element.is_a?(Prism::AssocNode)
+              # Non-symbol keys (`3 => io` for Process.spawn) are hash
+              # entries that cannot bind a keyword parameter.
+              infer(element.key)
+              infer(element.value)
             else
               positional << infer(element)
             end
@@ -681,9 +696,9 @@ module Autotype
 
     def infer_block(node)
       saved_environment = @environment.dup
-      parameter_types = []
+      parameter_types = bind_implicit_parameters(node.parameters)
 
-      if node.parameters&.parameters
+      if node.parameters.is_a?(Prism::BlockParametersNode) && node.parameters.parameters
         block_parameters = node.parameters.parameters
         (block_parameters.requireds + block_parameters.posts).each do |parameter|
           parameter_types << bind_block_parameter(parameter)
@@ -725,13 +740,29 @@ module Autotype
       type
     end
 
+    # `_1`/`_2` and `it` blocks carry no ParametersNode, only an arity.
+    def bind_implicit_parameters(parameters_node)
+      names =
+        case parameters_node
+        when Prism::NumberedParametersNode then (1..parameters_node.maximum).map { |index| :"_#{index}" }
+        when Prism::ItParametersNode then [:it]
+        else []
+        end
+      names.map { |name| @environment[name] = fresh(name) }
+    end
+
     def infer_lambda(node)
       saved_environment = @environment.dup
-      parameters = bind_parameters(node.parameters&.parameters)
+      parameter_types =
+        if node.parameters.is_a?(Prism::BlockParametersNode)
+          bind_parameters(node.parameters.parameters).map(&:type)
+        else
+          bind_implicit_parameters(node.parameters)
+        end
       result = infer(node.body)
       capture_block_locals(saved_environment)
       @environment = saved_environment
-      Function.new(parameters.map(&:type), result)
+      Function.new(parameter_types, result)
     end
 
     def infer_children(node)
@@ -760,7 +791,8 @@ module Autotype
 
   class Collector < Prism::Visitor
     attr_reader :methods, :constants, :includes, :declared_ports, :declared_config_options,
-                :declared_member_types, :structured_owners, :referenced_types
+                :declared_member_types, :structured_owners, :referenced_types, :diagnostics,
+                :defined_namespaces
 
     def initialize(path, profile: nil)
       @path = path
@@ -768,6 +800,8 @@ module Autotype
       @namespace = []
       @singleton = false
       @methods = []
+      @diagnostics = []
+      @defined_namespaces = Set.new
       @superclasses = {}
       @constants = {}
       @includes = Hash.new { |hash, key| hash[key] = [] }
@@ -792,11 +826,13 @@ module Autotype
     end
 
     def visit_module_node(node)
+      @defined_namespaces << qualified_owner(node.constant_path.slice)
       within_namespace(node.constant_path.slice) { super }
     end
 
     def visit_class_node(node)
       name = node.constant_path.slice
+      @defined_namespaces << qualified_owner(name)
       @superclasses[qualified_owner(name)] = node.superclass&.slice
       within_namespace(name) { super }
     end
@@ -820,14 +856,21 @@ module Autotype
             method.capabilities.empty?
         end
       end
-      analyzer = Analyzer.new
-      methods << analyzer.analyze(
-        node,
-        "#{owner}#{separator}#{node.name}",
-        owner: owner,
-        kind: singleton ? :singleton : :instance,
-        superclass: @superclasses[owner]
-      )
+      name = "#{owner}#{separator}#{node.name}"
+      begin
+        methods << Analyzer.new.analyze(
+          node,
+          name,
+          owner: owner,
+          kind: singleton ? :singleton : :instance,
+          superclass: @superclasses[owner]
+        )
+      rescue StandardError => error
+        diagnostics << Diagnostic.new(
+          kind: :analysis, path: @path, line: node.location.start_line, name: name,
+          message: "#{error.class}: #{error.message}"
+        )
+      end
       # A nested def has its own scope and is collected by the normal traversal.
       super
     end
@@ -960,8 +1003,11 @@ module Autotype
     # ubiquitous; recording their types lets the solver treat `RE.match?(x)`
     # or `PATTERNS.fetch(key)` like sends on the literal itself.
     def record_constant(name, value)
-      type = literal_constant_type(value)
-      @constants[qualified_owner(name)] = type if type
+      if class_factory_call?(value)
+        @defined_namespaces << qualified_owner(name)
+      elsif (type = literal_constant_type(value))
+        @constants[qualified_owner(name)] = type
+      end
     end
 
     def literal_constant_type(node)
@@ -974,6 +1020,13 @@ module Autotype
       when Prism::RegularExpressionNode, Prism::InterpolatedRegularExpressionNode then Named.new("Regexp")
       when Prism::ArrayNode then literal_array_type(node)
       when Prism::HashNode then literal_hash_type(node)
+      when Prism::LambdaNode then Named.new("Proc")
+      when Prism::ParenthesesNode
+        statements = node.body&.body
+        literal_constant_type(statements.first) if statements&.length == 1
+      # Aliases (`DEFAULT = PI`) stay references until ConstantResolver sees
+      # every file's constants.
+      when Prism::ConstantReadNode, Prism::ConstantPathNode then Named.new("Class[#{node.slice}]")
       when Prism::CallNode then literal_call_type(node)
       end
     end
@@ -1002,15 +1055,59 @@ module Autotype
       Generic.new("Hash", [key, value])
     end
 
+    STRING_LITERAL_CALLS = %i[chomp strip lstrip rstrip squish downcase upcase].to_set.freeze
+    FILE_STRING_CALLS = %i[expand_path join basename dirname read].to_set.freeze
+    CLASS_FACTORIES = { new: %w[Class Module Struct], define: %w[Data Entity] }.freeze
+    ARITHMETIC = %i[+ - * / % ** << >>].to_set.freeze
+
     def literal_call_type(node)
-      if %i[freeze dup].include?(node.name) && node.receiver
-        literal_constant_type(node.receiver)
-      elsif %i[new create_many].include?(node.name) && %w[Fast::Regexp Regexp].include?(node.receiver&.slice)
+      receiver = node.receiver
+      if ARITHMETIC.include?(node.name) && receiver && node.arguments&.arguments&.length == 1
+        literal_arithmetic_type(node.name, literal_constant_type(receiver),
+                                literal_constant_type(node.arguments.arguments.first))
+      elsif receiver.nil? && %i[lambda proc].include?(node.name) && node.block
+        Named.new("Proc")
+      elsif %i[freeze dup].include?(node.name) && receiver
+        literal_constant_type(receiver)
+      elsif %i[new create_many].include?(node.name) && %w[Fast::Regexp Regexp].include?(receiver&.slice)
         Named.new("Regexp")
-      elsif node.name == :to_set && node.receiver
-        inner = literal_constant_type(node.receiver)
+      elsif node.name == :to_set && receiver
+        inner = literal_constant_type(receiver)
         Generic.new("Set", inner.arguments) if inner.is_a?(Generic) && inner.name == "Array"
+      elsif node.name == :new && receiver.nil?
+        Named.new(current_owner) unless @namespace.empty?
+      elsif node.name == :new && constant_node?(receiver) && !class_factory_call?(node)
+        Named.new(receiver.slice)
+      elsif STRING_LITERAL_CALLS.include?(node.name) && receiver
+        Named.new("String") if literal_constant_type(receiver) == Named.new("String")
+      elsif receiver&.slice == "File" && FILE_STRING_CALLS.include?(node.name)
+        Named.new("String")
+      elsif receiver&.slice == "ENV" && node.name == :fetch
+        Named.new("String")
+      elsif receiver&.slice == "ENV" && node.name == :[]
+        Union.new([Named.new("String"), Named.new("nil")])
       end
+    end
+
+    def literal_arithmetic_type(message, left, right)
+      numeric = [Named.new("Integer"), Named.new("Float")]
+      if numeric.include?(left) && numeric.include?(right)
+        [left, right].include?(Named.new("Float")) ? Named.new("Float") : Named.new("Integer")
+      elsif left == Named.new("String") && %i[+ *].include?(message)
+        Named.new("String")
+      end
+    end
+
+    def class_factory_call?(node)
+      return false unless node.is_a?(Prism::CallNode)
+
+      receiver = node.receiver&.slice
+      CLASS_FACTORIES.fetch(node.name, []).include?(receiver) ||
+        (node.name == :define && @profile&.entity_define_receiver?(receiver)) || false
+    end
+
+    def constant_node?(node)
+      node.is_a?(Prism::ConstantReadNode) || node.is_a?(Prism::ConstantPathNode)
     end
 
     # attr_reader/attr_writer/attr_accessor define real methods, so synthesize
@@ -1082,6 +1179,124 @@ module Autotype
     end
   end
 
+  # The analyzer types every constant read as `Class[NAME]`, which is right
+  # for classes and modules but not for value constants. Once every file is
+  # collected, constants used as values take their value types: recorded
+  # literals (`TIMEOUT = 30`, `DEFAULT = PI`), core values (`ENV`), or an
+  # unknown for unrecorded SCREAMING_SNAKE names. Direct receivers keep
+  # `Class[NAME]` so the solver's class and literal rules still see them.
+  class ConstantResolver
+    STRING = Named.new("String")
+    FLOAT = Named.new("Float")
+    CORE_VALUES = {
+      "ENV" => Generic.new("Hash", [STRING, STRING]),
+      "ARGV" => Generic.new("Array", [STRING]),
+      "STDIN" => Named.new("IO"), "STDOUT" => Named.new("IO"), "STDERR" => Named.new("IO"),
+      "RUBY_VERSION" => STRING, "RUBY_PLATFORM" => STRING, "RUBY_ENGINE" => STRING,
+      "Float::INFINITY" => FLOAT, "Float::NAN" => FLOAT, "Float::EPSILON" => FLOAT,
+      "Float::MAX" => FLOAT, "Float::MIN" => FLOAT, "Math::PI" => FLOAT, "Math::E" => FLOAT,
+      "File::NULL" => STRING, "File::SEPARATOR" => STRING,
+      "Process::CLOCK_MONOTONIC" => Named.new("Integer"), "Process::CLOCK_REALTIME" => Named.new("Integer"),
+      "Encoding::UTF_8" => Named.new("Encoding"), "Encoding::BINARY" => Named.new("Encoding")
+    }.freeze
+    # Single all-caps words (`JSON`, `HTTP`, `SPINNER`) are as often modules
+    # as values, so only these two shapes are trusted without a definition.
+    VALUE_NAME = /\A[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\z/
+    CLASS_NAME = /[a-z]/
+
+    def self.value_name?(name) = VALUE_NAME.match?(name.split("::").last)
+    def self.class_name?(name) = CLASS_NAME.match?(name.split("::").last)
+
+    def initialize(constants, namespaces = Set.new)
+      @constants = constants
+      @namespaces = namespaces
+      @values = {}
+    end
+
+    # Recorded constants with aliases resolved, keyed like the collector's.
+    def constants
+      @constants.each_key.with_object({}) do |name, values|
+        value = recorded_value(name)
+        values[name] = value if value
+      end
+    end
+
+    def resolve(method)
+      scope = Object.new
+      unknowns = {}
+      substitute = lambda do |type|
+        substitute_values(type, method.owner) do |name|
+          unknowns[name] ||= TypeVariable.new(scope, unknowns.length, name.split("::").last.downcase)
+        end
+      end
+      method.with(
+        parameters: method.parameters.map { |parameter| parameter.with(type: substitute.(parameter.type)) },
+        result: substitute.(method.result),
+        capabilities: method.capabilities.map do |capability|
+          capability.with(
+            receiver: constant_name(capability.receiver) ? capability.receiver : substitute.(capability.receiver),
+            arguments: capability.arguments.map(&substitute),
+            keywords: capability.keywords.transform_values(&substitute)
+          )
+        end,
+        ivars: method.ivars.transform_values(&substitute),
+        locals: method.locals.transform_values(&substitute)
+      )
+    end
+
+    private
+
+    def substitute_values(type, owner, visiting = Set.new, &unknown)
+      substitute = ->(inner) { substitute_values(inner, owner, visiting, &unknown) }
+      case type
+      when Named
+        name = constant_name(type)
+        (name && value_type(name, owner, visiting, &unknown)) || type
+      when Generic
+        Generic.new(type.name, type.arguments.map(&substitute))
+      when Union
+        members = type.members.map(&substitute).flat_map { _1.is_a?(Union) ? _1.members : [_1] }.uniq
+        members.length == 1 ? members.first : Union.new(members)
+      when Function
+        Function.new(type.parameters.map(&substitute), substitute.(type.result))
+      else
+        type
+      end
+    end
+
+    def value_type(name, owner, visiting, &unknown)
+      constant = name.delete_prefix("::")
+      lexical_candidates(name, owner).each do |candidate|
+        return nil if @namespaces.include?(candidate)
+        return recorded_value(candidate, visiting) if @constants.key?(candidate)
+      end
+      return CORE_VALUES[constant] if CORE_VALUES.key?(constant)
+
+      unknown&.call(constant) if self.class.value_name?(constant)
+    end
+
+    # Nearest enclosing namespace first, as Ruby's lexical lookup does.
+    def lexical_candidates(name, owner)
+      return [name.delete_prefix("::")] if name.start_with?("::")
+
+      parts = owner.split("::")
+      parts.length.downto(0).map { |length| (parts.first(length) + [name]).join("::") }
+    end
+
+    def recorded_value(qualified, visiting = Set.new)
+      return @values[qualified] if @values.key?(qualified)
+      return nil unless visiting.add?(qualified)
+
+      value = substitute_values(@constants[qualified], qualified.rpartition("::").first, visiting)
+      visiting.delete(qualified)
+      @values[qualified] = constant_name(value) ? nil : value
+    end
+
+    def constant_name(type)
+      type.name[/\AClass\[(.+)\]\z/, 1] if type.is_a?(Named)
+    end
+  end
+
   class FixedPointInferencer
     MAX_ITERATIONS = 30
     PREDICATES = %i[
@@ -1095,6 +1310,14 @@ module Autotype
       strip! chomp! gsub! sub! downcase! upcase! squish!
     ].to_set.freeze
     STRING_LIST_RESULTS = %i[split lines chars].to_set.freeze
+    # Rules keyed only by message name that describe instances of core
+    # collections and strings.
+    INSTANCE_MESSAGES = (
+      INTEGER_RESULTS | STRING_RESULTS | STRING_LIST_RESULTS |
+      %i[map collect flat_map filter_map each_with_object reduce inject presence
+         << clear push append unshift prepend concat sort! uniq! compact! reverse! flatten! map!]
+    ).freeze
+    ZERO_ARITY_READERS = %i[length size bytesize].to_set.freeze
     NORETURN = Named.new("noreturn")
 
     attr_reader :iterations
@@ -1179,7 +1402,10 @@ module Autotype
         type = Named.new(type_name)
         @duck_index[member].each do |accessor|
           unify(accessor.result, type)
-          accessor.ivars.each_value { |ivar| unify(ivar, type) }
+          # Only the backing ivar: `def size = @items.length` says nothing
+          # about `@items`.
+          ivar = accessor.ivars[:"@#{member}"]
+          unify(ivar, type) if ivar
         end
       end
     end
@@ -1513,22 +1739,7 @@ module Autotype
 
     private
 
-    def native_solver_enabled?
-      return @native_solver_enabled if defined?(@native_solver_enabled)
-
-      @native_solver_enabled = begin
-        require_relative "native_bridge"
-        NativeBridge.enabled?
-      rescue LoadError, StandardError
-        false
-      end
-    end
-
     def solve_to_fixed_point
-      if native_solver_enabled?
-        NativeBridge.prime!(self)
-      end
-
       MAX_ITERATIONS.times do |iteration|
         @changed = false
         @duck_cache = {}
@@ -1604,8 +1815,10 @@ module Autotype
           receiver = literal
         else
           apply_class_builtin(constant, capability)
+          receiver = ConstantResolver::CORE_VALUES.fetch(constant, receiver)
         end
       end
+      return if INSTANCE_MESSAGES.include?(message) && !instance_rules_apply?(method, capability, receiver)
 
       if PREDICATES.include?(message)
         unify(result, Named.new("bool"))
@@ -1899,6 +2112,21 @@ module Autotype
       end
     end
 
+    # Name-keyed instance rules are guesses about core types. A class
+    # receiver (`Constraint.length(n)`), a non-stdlib arity (`size(n)`), or a
+    # repository definition for the receiver means the guess is about the
+    # wrong method.
+    def instance_rules_apply?(method, capability, receiver)
+      class_name = class_name_from(receiver)
+      return false if class_name && ConstantResolver.class_name?(class_name)
+      if ZERO_ARITY_READERS.include?(capability.message) &&
+         (capability.arguments.any? { !_1.is_a?(Function) } || capability.keywords.any?)
+        return false
+      end
+
+      resolve_target(method, capability).nil?
+    end
+
     SELF_RETURNING = %i[
       each each_with_index each_entry tap dup clone freeze itself
       << clear push append unshift prepend concat
@@ -1966,9 +2194,10 @@ module Autotype
         end
       when "File"
         case message
-        when :read, :basename, :dirname, :extname, :join, :expand_path, :absolute_path, :realpath
+        when :read, :binread, :basename, :dirname, :extname, :join, :expand_path, :absolute_path, :realpath
           unify(result, Named.new("String"))
         when :readlines then unify(result, Generic.new("Array", [Named.new("String")]))
+        when :size then unify(result, Named.new("Integer"))
         end
       when "Dir"
         unify(result, Generic.new("Array", [Named.new("String")])) if %i[glob children entries].include?(message)
@@ -2020,7 +2249,7 @@ module Autotype
     end
 
     DUCK_UNION_LIMIT = 8
-    DUCK_CORE_RECEIVERS = %w[String Integer Float Symbol bool Time Regexp MatchData noreturn].freeze
+    DUCK_CORE_RECEIVERS = %w[String Integer Float Symbol bool Time Regexp MatchData Proc noreturn].freeze
 
     # When the receiver's class is unknown but the message is defined in the
     # repository, dispatch by name: exactly when one method defines it, or by
@@ -2740,14 +2969,17 @@ module Autotype
       end
     end
 
-    def resolve_chained_source_type(method, capability)
+    def resolve_chained_source_type(method, capability, visited = Set.new.compare_by_identity)
+      # Unification can close a chain into a cycle (`node = node[:next]` in a loop).
+      return nil unless visited.add?(capability)
+
       receiver = resolve(capability.receiver)
       return receiver unless receiver.is_a?(TypeVariable)
 
       source = method.capabilities.find { |other| other.result.equal?(receiver) }
       return nil unless source
 
-      parent_type = resolve_chained_source_type(method, source)
+      parent_type = resolve_chained_source_type(method, source, visited)
       return nil unless parent_type
 
       case source.message
@@ -4435,45 +4667,11 @@ module Autotype
     end
 
     def self.expand_referenced_type_files(files, profile: default_profile)
-      expanded = files.dup
-      referenced = Set.new
-      files.each do |path|
-        next unless File.file?(path)
-
-        result = Prism.parse_file(path)
-        next unless result.success?
-
-        collector = Collector.new(path, profile: profile)
-        result.value.accept(collector)
-        collector.referenced_types.each do |type_name|
-          type_path = profile.locate_type_file(type_name)
-          referenced << type_path if type_path
-        end
-      end
-      (expanded + referenced.to_a).uniq
+      Pipeline.expand_referenced_type_files(files, profile: profile)
     end
 
     def self.build_metadata(collectors, profile: default_profile)
-      profile.finalize!(collectors) if profile.respond_to?(:finalize!)
-      metadata = InferenceMetadata.new(
-        member_type_hints: profile.member_type_hints,
-        option_type_hints: profile.option_type_hints,
-        side_effect_methods: profile.side_effect_methods,
-        structured_type_prefixes: profile.structured_type_prefixes,
-        port_wiring: profile.port_wiring,
-        output_emit: profile.output_emit,
-        config_hash: profile.config_hash,
-        framework_self_fallbacks: profile.framework_self_fallbacks,
-        type_locators: [profile.method(:locate_type_file)]
-      )
-      collectors.each do |collector|
-        metadata.merge_ports!(collector.declared_ports)
-        metadata.merge_member_types!(collector.declared_member_types)
-        metadata.merge_config_options!(collector.declared_config_options)
-        collector.structured_owners.each { |owner| metadata.structured_owners << owner }
-        collector.referenced_types.each { |type| metadata.referenced_types << type }
-      end
-      metadata
+      Pipeline.build_metadata(collectors, profile: profile)
     end
 
     def self.run(argv)
@@ -4515,51 +4713,14 @@ module Autotype
       Autotype.configuration.config_path = config_path if config_path
       Autotype.configuration.reload_profile!
 
-      files.reject! { |path| skipped_files.include?(path.delete_prefix("./")) }
-      profile = default_profile
-      profile.prepare_search!(files) if profile.respond_to?(:prepare_search!)
-      files = expand_referenced_type_files(files, profile: profile)
-
-      parse_errors = {}
-      constants = {}
-      includes = Hash.new { |hash, key| hash[key] = [] }
-      collectors = []
-      method_reports = files.flat_map do |path|
-        result = Prism.parse_file(path)
-        unless result.success?
-          warn "#{path}: parse failed"
-          result.errors.each { |error| warn "  L#{error.location.start_line}: #{error.message}" }
-          parse_errors[path] = result.errors.map { |error| "L#{error.location.start_line}: #{error.message}" }
-          next []
-        end
-
-        collector = Collector.new(path, profile: profile)
-        result.value.accept(collector)
-        collectors << collector
-        constants.merge!(collector.constants)
-        collector.includes.each { |owner, mods| includes[owner].concat(mods) }
-        collector.methods.map { |method| [path, method] }
-      end
-      includes.transform_values! { |mods| mods.uniq }
-      metadata = build_metadata(collectors, profile: profile)
-      inferencer = FixedPointInferencer.new(
-        method_reports.map(&:last),
-        constants: constants,
-        includes: includes,
-        metadata: metadata
-      )
-      analyzed_methods = method_reports.map(&:last)
-      solved_methods = inferencer.run
-      method_reports = method_reports.zip(solved_methods, analyzed_methods).map do |(path, _method), solved_method, analyzed_method|
-        [path, solved_method, analyzed_method]
-      end
+      pipeline = Pipeline.new(Autotype.expand_paths(files), profile: default_profile).solve
+      warn_diagnostics(pipeline.diagnostics)
       unless json
-        status = inferencer.converged? ? "converged" : "reached its iteration limit"
-        puts "Type inference #{status} after #{inferencer.iterations} iteration(s)"
+        status = pipeline.converged? ? "converged" : "reached its iteration limit"
+        puts "Type inference #{status} after #{pipeline.iterations} iteration(s)"
       end
-      helper_registry = UniversalHelperRegistry.new(analyzed_methods)
-      # Deterministic LLM-free names first; the OpenAI flags below override.
-      HeuristicCapabilityNamer.new(helper_registry).name!
+      helper_registry = pipeline.helper_registry
+      # The OpenAI flags below override the pipeline's heuristic names.
       if naming_cache_path
         OpenAiCapabilityNamer.new(
           helper_registry,
@@ -4578,21 +4739,19 @@ module Autotype
           return
         end
       end
-      if capability_names_path
-        helper_registry.apply_names!(load_capability_names(capability_names_path))
-      end
-      reports = method_reports.map do |path, method, analyzed_method|
-        [path, Renderer.new(method, analyzed_method: analyzed_method, helper_registry: helper_registry)]
-      end
+      capability_names = load_capability_names(capability_names_path) if capability_names_path
+      analysis = pipeline.analysis(capability_names: capability_names)
+      reports = pipeline.renderers
 
       if html_path
-        document = HtmlDocument.new(reports, analyzed_files: files, parse_errors: parse_errors)
+        parse_errors = pipeline.diagnostics.select { |diagnostic| diagnostic.kind == :parse }
+          .group_by(&:path)
+          .transform_values { |entries| entries.map { |diagnostic| "L#{diagnostic.line}: #{diagnostic.message}" } }
+        document = HtmlDocument.new(reports, analyzed_files: pipeline.files, parse_errors: parse_errors)
         File.write(html_path, document.render)
         puts "Wrote #{html_path} (#{reports.length} methods across #{reports.map(&:first).uniq.length} files)"
       elsif json
-        puts JSON.pretty_generate(
-          reports.group_by(&:first).transform_values { |entries| entries.map { |_, renderer| renderer.as_json } }
-        )
+        puts JSON.pretty_generate(analysis.to_h)
       else
         reports.group_by(&:first).each do |path, entries|
           puts path
@@ -4601,6 +4760,20 @@ module Autotype
             puts renderer.text
             puts
           end
+        end
+      end
+    end
+
+    def self.warn_diagnostics(diagnostics)
+      diagnostics.group_by(&:path).each do |path, entries|
+        parse_errors, failures = entries.partition { |diagnostic| diagnostic.kind == :parse }
+        unless parse_errors.empty?
+          warn "#{path}: parse failed"
+          parse_errors.each { |diagnostic| warn "  #{"L#{diagnostic.line}: " if diagnostic.line}#{diagnostic.message}" }
+        end
+        failures.each do |diagnostic|
+          location = [path, diagnostic.line].compact.join(":")
+          warn "#{location}: skipped #{diagnostic.name || "rest of file"} (#{diagnostic.message})"
         end
       end
     end

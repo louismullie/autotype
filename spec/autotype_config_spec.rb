@@ -59,6 +59,16 @@ RSpec.describe Autotype::DiscoveryProfile do
     )
   end
 
+  it "walks the project tree once however many types it locates" do
+    profile = described_class.new(root: fixture_root)
+    allow(Dir).to receive(:glob).and_call_original
+
+    expect(profile.locate_type_file("App::Entities::ToolCall")).to end_with("entities/tool_call.rb")
+    expect(profile.locate_type_file("App::Entities::ToolResult")).to end_with("entities/tool_result.rb")
+    expect(profile.locate_type_file("App::Entities::Missing")).to be_nil
+    expect(Dir).to have_received(:glob).once
+  end
+
   it "loads optional overrides from autotype.yml" do
     Dir.mktmpdir do |dir|
       config_path = File.join(dir, "autotype.yml")

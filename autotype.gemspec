@@ -18,16 +18,13 @@ Gem::Specification.new do |spec|
   spec.metadata["source_code_uri"] = spec.homepage
 
   spec.files = Dir.chdir(__dir__) do
-    Dir.glob("{exe,ext,lib,native,spec}/**/*", File::FNM_DOTMATCH).select do |path|
-      File.file?(path) &&
-        !path.end_with?(".o", ".bundle", ".so", ".dylib", "stc_solve", "/.DS_Store") &&
-        !path.include?("/.git/")
+    Dir.glob("{exe,lib,spec}/**/*", File::FNM_DOTMATCH).select do |path|
+      File.file?(path) && !path.end_with?("/.DS_Store") && !path.include?("/.git/")
     end + %w[README.md LICENSE autotype.gemspec Gemfile Rakefile autotype.example.yml]
   end
   spec.bindir = "exe"
   spec.executables = ["autotype"]
   spec.require_paths = ["lib"]
-  spec.extensions = ["ext/autotype/extconf.rb"]
 
   spec.add_runtime_dependency "async", "~> 2.0"
   spec.add_runtime_dependency "faraday", "~> 2.0"

@@ -26,7 +26,8 @@ RSpec.describe Autotype do
 
   def solve(source, profile: Autotype.profile)
     collector = collector_for(source, profile: profile)
-    analyzed_methods = collector.methods
+    resolver = described_class::ConstantResolver.new(collector.constants, collector.defined_namespaces)
+    analyzed_methods = collector.methods.map { |method| resolver.resolve(method) }
     metadata =
       if profile
         described_class::CLI.build_metadata([collector], profile: profile)
@@ -35,7 +36,7 @@ RSpec.describe Autotype do
       end
     methods = described_class::FixedPointInferencer.new(
       analyzed_methods,
-      constants: collector.constants,
+      constants: resolver.constants,
       includes: collector.includes,
       metadata: metadata
     ).run
@@ -1007,6 +1008,154 @@ RSpec.describe Autotype do
       expect(JSON.parse(File.read(path))).to eq(id => "ContextReadable")
       expect(registry.definitions.first.fetch(:name)).to eq("ContextReadable")
     end
+  end
+
+  it "analyzes destructured parameters and non-symbol keys in keyword hashes" do
+    methods = solve(<<~RUBY)
+      class Palette
+        def distance((r1, g1), (r2, (g2, *rest)))
+          (r1 - r2).abs + (g1 - g2).abs + rest.length
+        end
+
+        def spawn_child(cmd, pipe)
+          Process.spawn(cmd, 3 => pipe, 1.5 => pipe, "key" => pipe, out: File::NULL)
+        end
+      end
+    RUBY
+
+    expect(methods.fetch("Palette#distance").text.lines.first)
+      .to include("(r1, g1) Tuple[", "(r2, (g2, *rest)) Tuple[")
+    expect(methods.fetch("Palette#spawn_child").text).to include("spawn(Object, out: String)")
+  end
+
+  it "binds numbered and it block parameters like named ones" do
+    methods = solve(<<~RUBY)
+      class Roster
+        def named(people) = people.map { |person| person.name.upcase }
+        def numbered(people) = people.map { _1.name.upcase }
+        def implicit(people) = people.map { it.name.upcase }
+        def indexed(scores) = scores.each_with_index.map { |score, index| score * index }
+        def indexed_numbered(scores) = scores.each_with_index.map { _1 * _2 }
+        def lambda_named = ->(value) { value * 2 }
+        def lambda_numbered = -> { _1 * 2 }
+        def lambda_implicit = -> { it * 2 }
+      end
+    RUBY
+    signature = ->(name) { methods.fetch("Roster##{name}").text.lines.first.split(" : ", 2).last }
+
+    expect(signature.call("named")).to include("-> Array[String]")
+    expect(%w[numbered implicit].map(&signature)).to all(eq(signature.call("named")))
+    expect(signature.call("indexed_numbered")).to eq(signature.call("indexed"))
+    expect(%w[lambda_numbered lambda_implicit].map(&signature)).to all(eq(signature.call("lambda_named")))
+  end
+
+  it "skips a method the analyzer cannot handle and reports it" do
+    allow_any_instance_of(described_class::Analyzer).to receive(:analyze)
+      .and_wrap_original do |original, node, name, **options|
+        raise ArgumentError, "unsupported" if name == "Widget#broken"
+
+        original.call(node, name, **options)
+      end
+    collector = collector_for(<<~RUBY)
+      class Widget
+        def broken = 1
+        def fine = "ok"
+      end
+    RUBY
+
+    expect(collector.methods.map(&:name)).to eq(["Widget#fine"])
+    expect(collector.diagnostics).to contain_exactly(
+      have_attributes(kind: :analysis, name: "Widget#broken", line: 2, message: "ArgumentError: unsupported")
+    )
+  end
+
+  it "types value constants by their values instead of as classes" do
+    methods = solve(<<~RUBY)
+      module Shop
+        module Identity
+          PI = "pi"
+          DEFAULT = PI
+        end
+
+        class Checkout
+          TIMEOUT_MS = 120_000
+          PROMPT = <<~TEXT.chomp
+            hello
+          TEXT
+          CLOCK = Mutex.new
+          Handler = Class.new
+          Failure = StandardError
+
+          def initialize(timeout: TIMEOUT_MS, identity: Identity::DEFAULT, env: ENV, limit: UNKNOWN_LIMIT, lock: CLOCK)
+            @timeout = timeout
+          end
+
+          def prompt = PROMPT
+          def handler = Handler
+          def failure = Failure
+          def infinite = Float::INFINITY
+          def home = ENV["HOME"]
+          def seconds = TIMEOUT_MS / 1000
+        end
+      end
+    RUBY
+
+    signature = methods.fetch("Shop::Checkout#initialize").text.lines.first
+    expect(signature).to include(
+      "timeout:? Integer", "identity:? String", "env:? Hash[String, String]", "limit:? Object", "lock:? Mutex"
+    )
+    expect(signature).not_to include("Class[")
+    expect(methods.fetch("Shop::Checkout#prompt").text.lines.first).to include("-> String")
+    expect(methods.fetch("Shop::Checkout#handler").text.lines.first).to include("-> Class[Handler]")
+    expect(methods.fetch("Shop::Checkout#failure").text.lines.first).to include("-> Class[Failure]")
+    expect(methods.fetch("Shop::Checkout#infinite").text.lines.first).to include("-> Float")
+    expect(methods.fetch("Shop::Checkout#home").text.lines.first).to include("-> Nullable[String]")
+    expect(methods.fetch("Shop::Checkout#seconds").text.lines.first).to include("-> Integer")
+  end
+
+  it "keeps name-keyed instance rules off class receivers and repository methods" do
+    methods = solve(<<~RUBY)
+      class Panel
+        PAD = "  "
+        FRAMES = %w[a b].freeze
+
+        def constraint(n) = Ratatui::Constraint.length(n)
+        def joined(rows) = Chat::Delta.join(rows)
+        def label = Chat::Delta.to_s
+        def pad_width = PAD.length
+        def frame_count = FRAMES.size
+        def file_size(path) = File.size(path)
+      end
+
+      class Shirt
+        def size = "XL"
+        def doubled = size + size
+      end
+    RUBY
+
+    signature = ->(name) { methods.fetch(name).text.lines.first }
+    expect(signature.call("Panel#constraint")).to end_with("-> Object\n")
+    expect(signature.call("Panel#joined")).to end_with("-> Object\n")
+    expect(signature.call("Panel#label")).to end_with("-> String\n")
+    expect(signature.call("Panel#pad_width")).to end_with("-> Integer\n")
+    expect(signature.call("Panel#frame_count")).to end_with("-> Integer\n")
+    expect(signature.call("Panel#file_size")).to end_with("-> Integer\n")
+    expect(signature.call("Shirt#doubled")).to end_with("-> String\n")
+  end
+
+  it "applies member-name conventions only to the backing instance variable" do
+    methods = solve(<<~RUBY)
+      class Inventory
+        def initialize(items)
+          @items = items
+        end
+
+        def size = @items.length
+      end
+    RUBY
+
+    expect(methods.fetch("Inventory#initialize").text.lines.first).not_to include("Integer")
+    expect(methods.fetch("Inventory#size").text.lines.first).to end_with("-> Integer\n")
   end
 
   it "renders a searchable, escaped HTML report with coverage details" do
